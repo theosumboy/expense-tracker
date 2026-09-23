@@ -92,6 +92,7 @@ function showApp() {
   $('#app').classList.remove('hide');
   renderAll();
   sync();
+  takeSharedImage();
 }
 function askApi() {
   var v = prompt('Paste your Apps Script Web App URL (ends in /exec):', cfg.api || '');
@@ -190,7 +191,16 @@ function sync() {
     chain = chain.then(function () {
       return post({ action:'push', token:auth.token, items: news.map(strip) })
         .then(function (r) {
-          if (r && r.ok) news.forEach(function (t) { t._s = 1; });
+          if (!r || !r.ok) return;
+          // Only mark rows the server actually accepted. A row it silently
+          // skipped must stay pending, or it would be lost on the next merge.
+          var ok = {};
+          if (r.ids && r.ids.length) {
+            r.ids.forEach(function (id) { ok[id] = 1; });
+            news.forEach(function (t) { if (ok[t.id]) t._s = 1; });
+          } else {
+            news.forEach(function (t) { t._s = 1; });
+          }
         });
     });
   }
@@ -234,12 +244,14 @@ function byId(id) {
   return null;
 }
 
-/** Server is the source of truth for rows it knows; local-only rows survive. */
+/** Server is the source of truth for rows it knows. Any local row the server
+    does NOT have is kept and re-queued — never silently dropped, even if we
+    previously thought it was synced. Losing an entry is worse than a retry. */
 function merge(remote) {
   var map = {};
   remote.forEach(function (r) { r._s = 1; map[r.id] = r; });
   txns.forEach(function (t) {
-    if (!map[t.id]) { if (!t._s) map[t.id] = t; }        // not on server yet -> keep
+    if (!map[t.id]) { t._s = 0; map[t.id] = t; }
     else if (shots[t.id] && !map[t.id].screenshot) map[t.id].screenshot = '';
   });
   txns = Object.keys(map).map(function (k) { return map[k]; });
@@ -305,6 +317,7 @@ function saveEntry() {
   save(K.txns, txns);
 
   resetForm();
+  scanResult('');
   toast(draft.type + ' ' + money(amt) + ' saved');
   renderAll();
   sync();
@@ -331,6 +344,137 @@ function pickShot(file) {
     img.src = fr.result;
   };
   fr.readAsDataURL(file);
+}
+
+// ============================ scan a payment screenshot ============================
+/* Shrinks the image, sends it to Apps Script, which OCRs it through Google
+   Drive and returns amount / merchant / category. We only PRE-FILL the form —
+   nothing is ever saved without the user tapping Save. */
+
+function shrink(file, maxPx, quality) {
+  return new Promise(function (resolve, reject) {
+    var fr = new FileReader();
+    fr.onerror = function () { reject(new Error('read failed')); };
+    fr.onload = function () {
+      var img = new Image();
+      img.onerror = function () { reject(new Error('not an image')); };
+      img.onload = function () {
+        var s = Math.min(1, maxPx / Math.max(img.width, img.height));
+        var c = document.createElement('canvas');
+        c.width = Math.round(img.width * s);
+        c.height = Math.round(img.height * s);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        resolve(c.toDataURL('image/jpeg', quality));
+      };
+      img.src = fr.result;
+    };
+    fr.readAsDataURL(file);
+  });
+}
+
+function scanBusy(on, msg) {
+  $('#scanBusy').classList.toggle('hide', !on);
+  if (msg) $('#scanStep').textContent = msg;
+  $('#scanBtn').disabled = !!on;
+}
+
+function scanResult(html) {
+  var el = $('#scanResult');
+  if (!html) { el.classList.add('hide'); el.innerHTML = ''; return; }
+  el.innerHTML = html;
+  el.classList.remove('hide');
+}
+
+function scanReceipt(file) {
+  if (!file) return;
+  if (!auth || !cfg.api) { toast('Log in first'); return; }
+  if (!navigator.onLine) {
+    scanResult('<div><b>No internet</b><br>Scanning needs a connection. ' +
+               'Type the amount in for now — it still saves offline.</div>');
+    return;
+  }
+
+  go('add');
+  scanResult('');
+  scanBusy(true, 'Reading your screenshot…');
+
+  // Keep the receipt image for the entry itself, and a bigger copy for OCR.
+  shrink(file, 1100, 0.72).then(function (small) {
+    draft.shot = small;
+    $('#shotPrev').src = small;
+    $('#shotPrev').classList.remove('hide');
+    $('#shotClear').classList.remove('hide');
+    $('#shotBtn').textContent = 'Replace receipt';
+    return shrink(file, 1600, 0.82);
+  }).then(function (big) {
+    return post({ action: 'scan', token: auth.token, dataUrl: big });
+  }).then(function (r) {
+    scanBusy(false);
+
+    if (!r || !r.ok) {
+      var why = (r && r.error) === 'ocr_unavailable'
+        ? 'Scanning is not switched on yet — the Drive service needs adding to your Apps Script.'
+        : ((r && r.error) || 'Could not read that image.');
+      scanResult('<div><b>Could not read it</b><br>' + esc(why) +
+                 ' The receipt is still attached — just type the amount.</div>');
+      return;
+    }
+    applyScan(r);
+  }).catch(function () {
+    scanBusy(false);
+    scanResult('<div><b>Scan failed</b><br>Check your connection. ' +
+               'The receipt is attached — type the amount and save as normal.</div>');
+  });
+}
+
+function applyScan(r) {
+  var got = [];
+
+  if (r.amount) { $('#amt').value = r.amount; got.push('amount ' + money(r.amount)); }
+
+  if (r.category && CATS.indexOf(r.category) > -1) {
+    draft.category = r.category;
+    got.push('category ' + r.category);
+  }
+  if (r.mode && MODES.indexOf(r.mode) > -1) draft.mode = r.mode;
+  buildChips();
+
+  if (r.merchant) $('#rem').value = r.merchant;
+
+  var when = r.when ? new Date(r.when) : null;
+  if (when && !isNaN(when.getTime())) {
+    $('#dt').value = when.getFullYear() + '-' + pad(when.getMonth() + 1) + '-' + pad(when.getDate());
+    $('#tm').value = pad(when.getHours()) + ':' + pad(when.getMinutes());
+    got.push('date & time');
+  }
+
+  if (!got.length) {
+    scanResult('<div><b>Nothing readable found</b><br>' +
+      'The receipt is attached. Fill the amount in yourself and save.</div>');
+    return;
+  }
+
+  scanResult('<div><b>Read ' + esc(got.join(', ')) + '</b><br>' +
+    'Check it below and fix anything wrong, then tap Save entry.</div>');
+
+  if (!r.amount) { $('#amt').focus(); }
+}
+
+/* Image arriving from the Android share sheet, stashed by the service worker. */
+function takeSharedImage() {
+  if (location.search.indexOf('shared=1') < 0) return;
+  history.replaceState(null, '', location.pathname);
+  if (!('caches' in window)) return;
+
+  caches.open('paisa-share').then(function (c) {
+    return c.match('shared-image').then(function (res) {
+      if (!res) return;
+      return res.blob().then(function (b) {
+        c.delete('shared-image');
+        scanReceipt(new File([b], 'shared.jpg', { type: b.type || 'image/jpeg' }));
+      });
+    });
+  }).catch(function () {});
 }
 
 // ============================ analytics ============================
@@ -658,6 +802,11 @@ function init() {
   });
 
   $('#save').addEventListener('click', saveEntry);
+  $('#scanBtn').addEventListener('click', function () { $('#scanIn').click(); });
+  $('#scanIn').addEventListener('change', function (e) {
+    scanReceipt(e.target.files[0]);
+    e.target.value = '';
+  });
   $('#shotBtn').addEventListener('click', function () { $('#shotIn').click(); });
   $('#shotIn').addEventListener('change', function (e) { pickShot(e.target.files[0]); });
   $('#shotClear').addEventListener('click', function () {
