@@ -4,6 +4,8 @@
 'use strict';
 
 // ============================ storage ============================
+var APP_VERSION = 'v3';
+
 var K = { cfg:'et.cfg', auth:'et.auth', txns:'et.txns', bud:'et.bud',
           rec:'et.rec', shots:'et.shots', meta:'et.meta' };
 
@@ -645,7 +647,8 @@ function renderSettings() {
   }).join('') : '<div class="empty">Nothing recurring yet. Add rent, EMI or subscriptions.</div>';
 
   $('#acct').textContent = auth
-    ? 'Signed in as xxxxx' + String(auth.phone).slice(-5) + ' · ' + txns.length + ' entries stored'
+    ? 'Signed in as xxxxx' + String(auth.phone).slice(-5) + ' · ' +
+      txns.length + ' entries stored · app ' + APP_VERSION
     : '';
   $('#openSheet').href = (auth && auth.sheetUrl) || '#';
   $('#openSheet').style.display = (auth && auth.sheetUrl) ? 'block' : 'none';
@@ -885,7 +888,18 @@ function init() {
   else { setAuthMode(cfg.api ? 'login' : 'signup'); showAuth(); }
 
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(function(){});
+    // When a new version takes over, reload once by itself — so an update is
+    // live the first time the app is opened, not the second.
+    var hadController = !!navigator.serviceWorker.controller;
+    var reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', function () {
+      if (!hadController || reloaded) return;
+      reloaded = true;
+      location.reload();
+    });
+    navigator.serviceWorker.register('sw.js').then(function (reg) {
+      try { reg.update(); } catch (e) {}
+    }).catch(function () {});
   }
 }
 
