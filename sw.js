@@ -1,14 +1,22 @@
 /* Offline shell. The app's data lives in localStorage, not here —
    this only makes sure the app itself opens with no internet. */
-var CACHE = 'paisa-v2';
+var CACHE = 'paisa-v3';
 var KEEP = [CACHE, 'paisa-share'];
-var SHELL = ['./', 'index.html', 'app.js', 'manifest.webmanifest',
+var SHELL = ['./', 'index.html', 'app.js?v=3', 'manifest.webmanifest',
              'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', function (e) {
   e.waitUntil(
     caches.open(CACHE)
-      .then(function (c) { return c.addAll(SHELL).catch(function () {}); })
+      .then(function (c) {
+        // cache:'reload' = go past the browser's own HTTP cache, so an update
+        // never installs a stale file.
+        return Promise.all(SHELL.map(function (u) {
+          return fetch(new Request(u, { cache: 'reload' }))
+            .then(function (r) { return r.ok ? c.put(u, r) : null; })
+            .catch(function () {});
+        }));
+      })
       .then(function () { return self.skipWaiting(); })
   );
 });
@@ -54,8 +62,10 @@ self.addEventListener('fetch', function (e) {
   if (e.request.method !== 'GET') return;
 
   // Shell files: network first (so updates land), cache as fallback.
+  // 'no-cache' makes the browser revalidate with the server instead of
+  // silently handing back a stale copy from its own HTTP cache.
   e.respondWith(
-    fetch(e.request)
+    fetch(new Request(e.request.url, { cache: 'no-cache' }))
       .then(function (r) {
         if (r && r.status === 200 && url.origin === location.origin) {
           var copy = r.clone();
