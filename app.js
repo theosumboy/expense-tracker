@@ -4,7 +4,12 @@
 'use strict';
 
 // ============================ storage ============================
-var APP_VERSION = 'v3';
+var APP_VERSION = 'v5';
+
+/* Your Apps Script backend. Baked in so nobody ever has to paste a URL.
+   Changing it later: Settings -> Change server URL. */
+var DEFAULT_API =
+  'https://script.google.com/macros/s/AKfycbyPHIS3jiS47uZtoCmrXrHwVAigPCIdNxxKrmyKFK46hPtCPG6PvNnRBrUWYnYRwMUk2g/exec';
 
 var K = { cfg:'et.cfg', auth:'et.auth', txns:'et.txns', bud:'et.bud',
           rec:'et.rec', shots:'et.shots', meta:'et.meta' };
@@ -19,6 +24,7 @@ function save(k, v) {
 }
 
 var cfg   = load(K.cfg,  { api:'' });
+if (!cfg.api && DEFAULT_API) { cfg.api = DEFAULT_API; save(K.cfg, cfg); }
 var auth  = load(K.auth, null);
 var txns  = load(K.txns, []);
 var bud   = load(K.bud,  {});
@@ -87,7 +93,6 @@ var authMode = 'login';
 function showAuth() {
   $('#auth').classList.remove('hide');
   $('#app').classList.add('hide');
-  if (!cfg.api) setTimeout(askApi, 350);
 }
 function showApp() {
   $('#auth').classList.add('hide');
@@ -415,10 +420,15 @@ function scanReceipt(file) {
 
     if (!r || !r.ok) {
       var why = (r && r.error) === 'ocr_unavailable'
-        ? 'Scanning is not switched on yet — the Drive service needs adding to your Apps Script.'
+        ? 'Scanning could not start on the server.'
         : ((r && r.error) || 'Could not read that image.');
+      var detail = (r && r.detail)
+        ? '<br><br><small style="opacity:.8;word-break:break-word">' +
+          esc(String(r.detail).slice(0, 300)) + '</small>'
+        : '';
       scanResult('<div><b>Could not read it</b><br>' + esc(why) +
-                 ' The receipt is still attached — just type the amount.</div>');
+                 ' The receipt is still attached — just type the amount.' +
+                 detail + '</div>');
       return;
     }
     applyScan(r);
@@ -862,7 +872,10 @@ function init() {
   $('#authSwap').addEventListener('click', function () {
     setAuthMode(authMode === 'login' ? 'signup' : 'login');
   });
+  // The server URL is built in, so the login screen never mentions it.
+  if (DEFAULT_API) $('#authCfg').classList.add('hide');
   $('#authCfg').addEventListener('click', askApi);
+  $('#setApi').addEventListener('click', askApi);
   ['#p1','#p2','#p3','#p4'].forEach(function (s, i, arr) {
     $(s).addEventListener('input', function () {
       $(s).value = $(s).value.replace(/\D/g,'');
