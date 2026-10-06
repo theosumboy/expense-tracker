@@ -1,8 +1,8 @@
 /* Offline shell. The app's data lives in localStorage, not here —
    this only makes sure the app itself opens with no internet. */
-var CACHE = 'paisa-v5';
+var CACHE = 'paisa-v7';
 var KEEP = [CACHE, 'paisa-share'];
-var SHELL = ['./', 'index.html', 'app.js?v=5', 'manifest.webmanifest',
+var SHELL = ['./', 'index.html', 'app.js?v=7', 'manifest.webmanifest',
              'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', function (e) {
