@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Privacy Policy — Paisa</title>
+<style>
+:root{
+  color-scheme: light;
+  --bg:#f4f4f1; --surface:#fcfcfb; --ink:#0b0b0b; --ink-2:#52514e;
+  --muted:#898781; --line:#e1e0d9; --brand:#2a78d6;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --bg:#0d0d0d; --surface:#1a1a19; --ink:#fff; --ink-2:#c3c2b7;
+    --muted:#898781; --line:#2c2c2a; --brand:#3987e5;
+  }
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif;
+  padding:32px 16px 64px;
+}
+main{max-width:720px;margin:0 auto}
+.logo{width:48px;height:48px;border-radius:14px;background:var(--brand);
+  display:grid;place-items:center;color:#fff;font-size:24px;font-weight:700;margin-bottom:20px}
+h1{font-size:30px;letter-spacing:-.02em;margin:0 0 6px}
+.updated{color:var(--muted);font-size:14px;margin:0 0 32px}
+h2{font-size:19px;letter-spacing:-.01em;margin:34px 0 10px}
+p,li{color:var(--ink-2)}
+li{margin-bottom:7px}
+strong{color:var(--ink)}
+.box{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+  padding:18px 20px;margin:22px 0}
+.box p:first-child{margin-top:0}
+.box p:last-child{margin-bottom:0}
+table{width:100%;border-collapse:collapse;margin:16px 0;font-size:15px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--ink);font-weight:650;font-size:13px;text-transform:uppercase;letter-spacing:.04em}
+td{color:var(--ink-2)}
+a{color:var(--brand)}
+footer{margin-top:44px;padding-top:20px;border-top:1px solid var(--line);
+  color:var(--muted);font-size:14px}
+</style>
+</head>
+<body>
+<main>
+  <div class="logo">₹</div>
+  <h1>Privacy Policy</h1>
+  <p class="updated">Paisa — expense tracker · Last updated 7 October 2026</p>
+
+  <div class="box">
+    <p><strong>The short version.</strong> Your expenses are stored in a Google
+    Sheet inside your own Google Drive. They are not sent to us, not copied to
+    our servers, and we have no way to read them. If you sign up with an email
+    address, we store that address and a scrambled version of your password —
+    nothing else.</p>
+  </div>
+
+  <h2>Who runs this app</h2>
+  <p>Paisa is an independent app built and maintained by Akshat Sinha. You can
+  reach me at <a href="mailto:ak0005sinha@gmail.com">ak0005sinha@gmail.com</a>
+  with any question about this policy or your data.</p>
+
+  <h2>What the app stores, and where</h2>
+
+  <table>
+    <tr>
+      <th>Information</th>
+      <th>Where it lives</th>
+      <th>Can we see it?</th>
+    </tr>
+    <tr>
+      <td>Your expenses, income and savings entries</td>
+      <td>A Google Sheet created in <strong>your</strong> Google Drive</td>
+      <td><strong>No</strong></td>
+    </tr>
+    <tr>
+      <td>Receipt screenshots you choose to scan</td>
+      <td>Converted to text in your own Google Drive, then deleted</td>
+      <td><strong>No</strong></td>
+    </tr>
+    <tr>
+      <td>Budgets, categories, your 4-digit PIN</td>
+      <td>Your phone's local browser storage</td>
+      <td><strong>No</strong></td>
+    </tr>
+    <tr>
+      <td>Your email address (email sign-up only)</td>
+      <td>A private spreadsheet we control</td>
+      <td>Yes — the address only</td>
+    </tr>
+    <tr>
+      <td>Your password (email sign-up only)</td>
+      <td>Stored as a one-way hash</td>
+      <td><strong>No</strong> — it cannot be reversed</td>
+    </tr>
+  </table>
+
+  <h2>How we use Google services</h2>
+
+  <p>When you connect Google Drive, Paisa asks for a single permission:
+  <strong>https://www.googleapis.com/auth/drive.file</strong>.</p>
+
+  <p>This permission is deliberately the narrowest one Google offers for Drive.
+  It grants access <em>only</em> to files the app itself creates — in practice,
+  the one spreadsheet named "Paisa — Expense Tracker", plus temporary files used
+  to read a receipt. The app cannot see, open, or list any other file in your
+  Drive. We do not request access to your documents, photos, or anything else.</p>
+
+  <p>We also receive your email address through Google sign-in, so the app can
+  show you which account you are signed in as. For Google sign-ins this address
+  stays on your device and is not sent to us.</p>
+
+  <p>Paisa's use of information received from Google APIs follows the
+  <a href="https://developers.google.com/terms/api-services-user-data-policy"
+     rel="noopener">Google API Services User Data Policy</a>, including its
+  Limited Use requirements.</p>
+
+  <h2>What we do not do</h2>
+  <ul>
+    <li>We do not sell, rent, or share your information with anyone.</li>
+    <li>We do not show advertising, and we do not run advertising trackers.</li>
+    <li>We do not use analytics tools that profile you.</li>
+    <li>We do not use your data to train machine learning models.</li>
+    <li>We do not read, aggregate, or analyse your spending. We cannot — it is
+      not stored anywhere we can reach.</li>
+  </ul>
+
+  <h2>Receipt scanning, explained</h2>
+  <p>When you scan a payment screenshot, the image is uploaded to your own
+  Google Drive and converted to a Google Doc, which is how Google extracts the
+  text. The app reads that text back, deletes the temporary document, and works
+  out the amount and merchant on your phone. The image never reaches us, and the
+  temporary file is removed as soon as the text has been read.</p>
+
+  <h2>Your control over your data</h2>
+  <ul>
+    <li><strong>See everything.</strong> Open the spreadsheet in your Google
+      Drive at any time. It is an ordinary file that belongs to you.</li>
+    <li><strong>Delete everything.</strong> Delete that spreadsheet. The data is
+      gone, because that file is the only copy.</li>
+    <li><strong>Revoke our access.</strong> Visit
+      <a href="https://myaccount.google.com/permissions" rel="noopener">your
+      Google account permissions</a> and remove Paisa. The app immediately loses
+      all access; your spreadsheet stays with you.</li>
+    <li><strong>Remove your email account.</strong> Email me and I will delete
+      your email address and password hash from our records.</li>
+    <li><strong>Clear your phone.</strong> Logging out removes the local copy
+      held on your device.</li>
+  </ul>
+
+  <h2>Keeping it secure</h2>
+  <p>All communication with Google happens over encrypted connections.
+  Passwords are hashed on your device before being sent, using PBKDF2, and are
+  hashed again before storage — so the original password is never transmitted
+  and cannot be recovered from what we hold. Your 4-digit PIN never leaves your
+  phone.</p>
+  <p>No system is perfectly secure. The structural protection here is that we
+  hold almost nothing: there is no database of expenses to breach, because the
+  expenses live in your Google account rather than ours.</p>
+
+  <h2>Children</h2>
+  <p>Paisa is not directed at children under 13, and we do not knowingly collect
+  information from them.</p>
+
+  <h2>Changes to this policy</h2>
+  <p>If this policy changes in a way that affects how your information is
+  handled, the date at the top will change and the updated version will appear
+  on this page. Material changes will be announced in the app.</p>
+
+  <h2>Contact</h2>
+  <p>Questions, deletion requests, or anything else:
+  <a href="mailto:ak0005sinha@gmail.com">ak0005sinha@gmail.com</a>.</p>
+
+  <footer>
+    Paisa · <a href="./">Back to the app</a>
+  </footer>
+</main>
+</body>
+</html>
