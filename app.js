@@ -10,7 +10,7 @@
 (function () {
 'use strict';
 
-var APP_VERSION = 'v7';
+var APP_VERSION = 'v8';
 
 /* Your Google OAuth client. Safe to be public — it identifies the app, it
    grants nothing on its own. */
@@ -110,36 +110,63 @@ function loadGis() {
   });
 }
 
-/** Returns a usable access token, asking the user only when it has to. */
+function gisReady() {
+  return !!(window.google && window.google.accounts && window.google.accounts.oauth2);
+}
+
+function askGoogle(interactive) {
+  return new Promise(function (resolve, reject) {
+    if (!tokenClient) {
+      tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: CLIENT_ID,
+        scope: SCOPES,
+        callback: function () {}   // replaced per request below
+      });
+    }
+    tokenClient.callback = function (res) {
+      if (res && res.access_token) {
+        gToken = res.access_token;
+        gExpiry = Date.now() + (Number(res.expires_in || 3600) * 1000);
+        resolve(gToken);
+      } else {
+        reject(new Error(res && res.error ? res.error : 'no_token'));
+      }
+    };
+    tokenClient.error_callback = function (err) {
+      reject(new Error((err && err.type) || 'popup_failed'));
+    };
+    try {
+      tokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
+    } catch (e) { reject(e); }
+  });
+}
+
+/**
+ * Returns a usable access token, asking the user only when it has to.
+ *
+ * The Google popup must open during the SAME synchronous turn as the click
+ * that triggered it, or the browser blocks it. So when the Google library is
+ * already loaded we call straight through with no promise in between —
+ * awaiting anything first silently costs us the popup.
+ */
 function token(interactive) {
   if (gToken && Date.now() < gExpiry - 60000) return Promise.resolve(gToken);
+  if (gisReady()) return askGoogle(interactive);
+  return loadGis().then(function () { return askGoogle(interactive); });
+}
 
-  return loadGis().then(function () {
-    return new Promise(function (resolve, reject) {
-      if (!tokenClient) {
-        tokenClient = google.accounts.oauth2.initTokenClient({
-          client_id: CLIENT_ID,
-          scope: SCOPES,
-          callback: function () {}   // replaced per request below
-        });
-      }
-      tokenClient.callback = function (res) {
-        if (res && res.access_token) {
-          gToken = res.access_token;
-          gExpiry = Date.now() + (Number(res.expires_in || 3600) * 1000);
-          resolve(gToken);
-        } else {
-          reject(new Error(res && res.error ? res.error : 'no token'));
-        }
-      };
-      tokenClient.error_callback = function (err) {
-        reject(new Error(err && err.type ? err.type : 'popup closed'));
-      };
-      try {
-        tokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
-      } catch (e) { reject(e); }
-    });
-  });
+/** Plain-English version of Google's error codes. */
+function authReason(e) {
+  var m = String((e && e.message) || '');
+  if (/popup_closed|user_cancel|abort/i.test(m))
+    return 'The Google window was closed before you finished.';
+  if (/popup_failed|popup_blocked/i.test(m))
+    return 'Your browser blocked the Google pop-up. Allow pop-ups for this site and try again.';
+  if (/access_denied|denied/i.test(m))
+    return 'Permission was declined. Paisa needs it to create your sheet.';
+  if (/idpiframe|origin|invalid_client/i.test(m))
+    return 'This site is not registered with Google yet.';
+  return m || 'Something went wrong talking to Google.';
 }
 
 function gfetch(url, opts) {
@@ -658,14 +685,20 @@ function doGoogle() {
   }).catch(function (e) {
     busy(false);
     step('welcome');
-    toast(/popup|closed|denied/i.test(e.message) ? 'Sign-in cancelled' : 'Google sign-in failed');
+    toast(authReason(e));
   });
 }
 
 function connectDrive() {
   busy(true, 'Setting up your sheet…');
   $('#driveErr').textContent = '';
-  return token(true)
+
+  // If signing in already got us a token, reuse it. Asking a second time in
+  // the same flow opens a popup the browser will block, because the click
+  // that allowed the first one is already spent.
+  var have = gToken && Date.now() < gExpiry - 60000;
+
+  return (have ? Promise.resolve(gToken) : token(true))
     .then(function () { return ensureSheet(); })
     .then(function () { return pullAll(); })
     .then(function () {
@@ -675,10 +708,10 @@ function connectDrive() {
     .catch(function (e) {
       busy(false);
       step('drive');
-      $('#driveErr').textContent =
-        /popup|closed|denied|access_denied/i.test(e.message)
-          ? 'Permission was not granted. Paisa needs it to make your sheet.'
-          : 'Could not set up your sheet. ' + e.message.slice(0, 120);
+      var m = String((e && e.message) || '');
+      $('#driveErr').textContent = /Google API/.test(m)
+        ? 'Could not create your sheet. ' + m.slice(0, 300)
+        : authReason(e);
     });
 }
 
@@ -1225,6 +1258,11 @@ function openApp() {
 
 // ============================ wiring ============================
 function init() {
+  // Load Google's library up front, so that when the user taps a button the
+  // popup can open in the same instant as the tap. Loading it lazily on the
+  // click costs us the popup — browsers only allow one during the click.
+  loadGis().catch(function () {});
+
   // --- onboarding ---
   $('#goGoogle').addEventListener('click', doGoogle);
   $('#goEmail').addEventListener('click', function () { setEmailMode('signup'); step('email'); });
