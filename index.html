@@ -80,7 +80,7 @@ main{padding:var(--pad);max-width:560px;margin:0 auto}
 nav.tabs{
   position:fixed;left:0;right:0;bottom:0;z-index:30;
   background:var(--surface);border-top:1px solid var(--line);
-  display:grid;grid-template-columns:repeat(4,1fr);
+  display:grid;grid-template-columns:repeat(5,1fr);
   padding-bottom:env(safe-area-inset-bottom)
 }
 nav.tabs button{
@@ -207,11 +207,22 @@ input.amount::placeholder{color:var(--line)}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px}
 
 /* ---------- month switcher + calendar ---------- */
-.monthnav{display:flex;align-items:center;gap:6px;margin-bottom:12px}
-.monthnav b{flex:1;text-align:center;font-size:15.5px;font-weight:650}
-.monthnav button{width:40px;height:36px;border-radius:10px;background:var(--surface);
-  border:1px solid var(--line);font-size:19px;font-weight:600;color:var(--ink-2)}
-.monthnav button.today{width:auto;padding:0 11px;font-size:12.5px;color:var(--brand)}
+.hmonth{display:flex;align-items:center;gap:2px;flex:none}
+.hmonth button{height:30px;min-width:28px;border-radius:8px;font-size:18px;font-weight:600;color:var(--ink-2)}
+.hmonth .lbl{font-size:13px;font-weight:650;color:var(--ink);padding:0 8px;min-width:76px;
+  background:var(--surface-2);border:1px solid var(--line)}
+.hmonth .lbl.off{background:var(--brand);border-color:var(--brand);color:#fff}
+header.top h1{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.f>span em{float:right;font-style:normal;text-transform:none;letter-spacing:0;font-weight:600;color:var(--ink-2)}
+.f>span em.warn{color:var(--warn)} .f>span em.crit{color:var(--crit)}
+.kvs{margin:0}
+.kv{display:grid;grid-template-columns:118px 1fr;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);
+  font-size:13.5px;align-items:center}
+.kv:last-child{border-bottom:0}
+.kv dt{color:var(--muted);font-weight:600;font-size:12.5px}
+.kv dd{margin:0;color:var(--ink);word-break:break-word;font-weight:550}
+.kv dd small{display:block;color:var(--muted);font-size:11.5px;font-weight:500;margin-top:1px}
+.kv .in{padding:8px 11px}
 .cal{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
 .cal .wd{font-size:10.5px;font-weight:650;color:var(--muted);text-align:center;padding-bottom:2px}
 .cal .day{min-height:50px;border-radius:9px;background:var(--surface-2);border:1px solid transparent;
@@ -387,6 +398,11 @@ input.amount::placeholder{color:var(--line)}
 <div id="app" class="hide">
 <header class="top">
   <h1 id="screenTitle">Add entry</h1>
+  <div class="monthnav hmonth" id="hMonth">
+    <button type="button" data-step="-1" aria-label="Previous month">‹</button>
+    <button type="button" id="hMonthLbl" class="lbl" data-step="0">—</button>
+    <button type="button" data-step="1" aria-label="Next month">›</button>
+  </div>
   <span class="pill" id="syncPill">·</span>
 </header>
 
@@ -406,6 +422,7 @@ input.amount::placeholder{color:var(--line)}
     </div>
 
     <div class="alert read hide" id="scanResult"></div>
+    <div class="alert warn hide" id="backNote"></div>
 
     <div class="card">
       <div class="seg" id="typeSeg">
@@ -460,14 +477,13 @@ input.amount::placeholder{color:var(--line)}
       <button class="btn" id="save">Save expense</button>
     </div>
     <div class="card" id="recentCard">
-      <h2>Recent</h2>
+      <h2 id="recentTitle">Recent</h2>
       <div id="recentList"></div>
     </div>
   </section>
 
   <!-- ---------- STATS ---------- -->
   <section id="v-stats" class="hide">
-    <div class="monthnav"><button type="button" data-step="-1" aria-label="Previous month">‹</button><b></b><button type="button" class="today" data-step="0">This month</button><button type="button" data-step="1" aria-label="Next month">›</button></div>
     <div id="alerts"></div>
     <div class="card">
       <div class="hero">
@@ -525,7 +541,6 @@ input.amount::placeholder{color:var(--line)}
 
   <!-- ---------- HISTORY ---------- -->
   <section id="v-hist" class="hide">
-    <div class="monthnav"><button type="button" data-step="-1" aria-label="Previous month">‹</button><b></b><button type="button" class="today" data-step="0">This month</button><button type="button" data-step="1" aria-label="Next month">›</button></div>
     <div class="card"><div class="cal" id="cal"></div></div>
     <div class="card">
       <input class="in" id="q" type="search" placeholder="Search all months — remarks, category, amount…">
@@ -534,11 +549,11 @@ input.amount::placeholder{color:var(--line)}
     <div class="card"><div id="histHead"></div><div id="histList"></div></div>
   </section>
 
-  <!-- ---------- SETTINGS ---------- -->
-  <section id="v-set" class="hide">
+  <!-- ---------- BUDGET ---------- -->
+  <section id="v-bud" class="hide">
     <div class="card">
       <h2>Monthly budget</h2>
-      <label class="f"><span>Overall limit (₹)</span>
+      <label class="f"><span>Overall limit (₹)<em id="bTotalSpent"></em></span>
         <input class="in" id="bTotal" type="number" inputmode="numeric" placeholder="e.g. 25000"></label>
       <div id="bCats"></div>
       <button class="btn sm" id="bSave">Save budgets</button>
@@ -549,15 +564,31 @@ input.amount::placeholder{color:var(--line)}
       <div id="recList"></div>
       <button class="btn ghost sm" id="recAdd" style="margin-top:10px">+ Add a monthly saving</button>
     </div>
+  </section>
 
+  <!-- ---------- SETTINGS ---------- -->
+  <section id="v-set" class="hide">
     <div class="card">
       <h2>Account</h2>
-      <div style="font-size:13.5px;color:var(--ink-2);margin-bottom:12px" id="acct"></div>
+      <dl class="kvs" id="acct"></dl>
+    </div>
+
+    <div class="card">
+      <h2>Security</h2>
+      <button class="btn ghost sm" id="pinBtn" style="margin-bottom:9px">Change PIN</button>
+      <button class="btn ghost sm hide" id="pinOff">Turn the PIN off</button>
+    </div>
+
+    <div class="card">
+      <h2>Your data</h2>
       <a class="btn ghost sm" id="openSheet" target="_blank" rel="noopener"
          style="display:block;text-align:center;text-decoration:none;margin-bottom:9px">Open my Google Sheet</a>
       <button class="btn ghost sm" id="syncNow" style="margin-bottom:9px">Sync now</button>
-      <button class="btn ghost sm" id="exportCsv" style="margin-bottom:9px">Export CSV</button>
-      <button class="btn ghost sm" id="pinBtn" style="margin-bottom:9px">Change PIN</button>
+      <button class="btn ghost sm" id="exportCsv">Export CSV</button>
+    </div>
+
+    <div class="card">
+      <h2>Sign out</h2>
       <button class="btn danger sm" id="logout" style="margin-bottom:9px">Log out</button>
       <button class="btn danger sm" id="resetAll">Reset everything on this phone</button>
       <div style="font-size:12px;color:var(--muted);margin-top:8px">Reset clears your login, PIN,
@@ -570,10 +601,11 @@ input.amount::placeholder{color:var(--line)}
   <button data-v="add" aria-selected="true"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Add</button>
   <button data-v="stats" aria-selected="false"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Stats</button>
   <button data-v="hist" aria-selected="false"><svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h12"/></svg>History</button>
+  <button data-v="bud" aria-selected="false"><svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20M16 15h2"/><path d="M6 6V4h12v2"/></svg>Budget</button>
   <button data-v="set" aria-selected="false"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 7.9 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H2a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 3.7 7.9a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 2.7-1.1V2a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 2.7 1.1 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.7H22a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1.6z"/></svg>Settings</button>
 </nav>
 </div>
 
-<script src="app.js?v=10"></script>
+<script src="app.js?v=11"></script>
 </body>
 </html>
