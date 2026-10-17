@@ -10,7 +10,7 @@
 (function () {
 'use strict';
 
-var APP_VERSION = 'v9';
+var APP_VERSION = 'v10';
 
 /* Your Google OAuth client. Safe to be public — it identifies the app, it
    grants nothing on its own. */
@@ -28,12 +28,38 @@ var ACCOUNTS_API =
 var SHEET_NAME = 'Paisa — Expense Tracker';
 var TXN_HEADERS = ['DATE','TIME','TYPE','CATEGORY','AMOUNT','MODE','REMARKS','SCREENSHOT','ID'];
 
-var CATS  = ['Food','Grocery','Transportation','Shopping','Entertainment',
-             'Bills & Recharge','Health','Rent / EMI','Education','Other'];
-var MODES = ['UPI','Cash','Card','Net Banking','Other'];
+/* Each type has its own vocabulary. They all land in the same CATEGORY and
+   MODE columns of the sheet, so the sheet layout never changes. */
+var CATS = {
+  Expense: ['Food','Grocery','Transportation','Shopping','Entertainment',
+            'Bills & Recharge','Health','Rent / EMI','Education','Other'],
+  Income:  ['Salary','Business','Freelance','Interest','Dividend','Rental',
+            'Gift','Refund','Other'],
+  Savings: ['Mutual fund / SIP','Fixed deposit','Recurring deposit','PPF','NPS',
+            'Stocks','Gold','Savings account','Emergency fund','Other']
+};
+/* Interest is stored as "Interest · Fixed deposit", so it still groups under
+   Interest when filtering, and the sheet stays one column wide. */
+var INTEREST = ['Savings account','Fixed deposit','Recurring deposit','Mutual funds','Bonds','Other'];
+var SUB_SEP = ' · ';
+var MODES = {
+  Expense: ['UPI','Cash','Card','Net Banking','Other'],
+  Income:  ['Bank transfer','UPI','Cash','Cheque','Other'],
+  Savings: ['Auto-debit','UPI','Net Banking','Cash','Other']
+};
+var LABELS = {
+  Expense: { cat:'Category', mode:'Paid by',      save:'Save expense' },
+  Income:  { cat:'Source',   mode:'Received via', save:'Save income' },
+  Savings: { cat:'Saved in', mode:'Paid from',    save:'Save savings' }
+};
+var TYPES = ['Expense','Income','Savings'];
 
 // ============================ storage ============================
-var K = { acct:'p.acct', txns:'p.txns', bud:'p.bud', rec:'p.rec', shots:'p.shots' };
+/* p.recur, not the old p.rec: pre-v7 builds left a different shape under
+   p.rec and it must not be mistaken for a rule. p.tok is the Google access
+   token, kept so that reopening the app within the hour needs no sign-in. */
+var K = { acct:'p.acct', txns:'p.txns', bud:'p.bud', recur:'p.recur', shots:'p.shots',
+          tok:'p.tok' };
 
 function load(k, d) {
   try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; }
@@ -47,7 +73,7 @@ function save(k, v) {
 var acct  = load(K.acct, null);   // {mode:'google'|'email', email, sheetId, gid, pinHash}
 var txns  = load(K.txns, []);
 var bud   = load(K.bud, {});
-var rec   = load(K.rec, []);
+var recur = load(K.recur, []);    // [{id, category, amount, mode, remarks, day, time, last:'YYYY-MM'}]
 var shots = load(K.shots, {});
 
 // ============================ helpers ============================
@@ -66,6 +92,18 @@ function moneyShort(n){
 }
 function ym(d){ d = new Date(d); return d.getFullYear() + '-' + pad(d.getMonth()+1); }
 function monthName(d){ return new Date(d).toLocaleDateString('en-IN',{month:'long',year:'numeric'}); }
+/** 'YYYY-MM' → Date on the 1st. Built from parts: new Date('2026-09') is UTC
+    midnight, which is still August in some timezones. */
+function ymDate(k){ var p = String(k).split('-'); return new Date(+p[0], +p[1]-1, 1); }
+function ymShift(k, n){ var d = ymDate(k); return ym(new Date(d.getFullYear(), d.getMonth()+n, 1)); }
+function daysIn(k){ var d = ymDate(k); return new Date(d.getFullYear(), d.getMonth()+1, 0).getDate(); }
+function ymd(d){ d = new Date(d); return ym(d) + '-' + pad(d.getDate()); }
+function ordinal(n){
+  var s = (n % 100 >= 11 && n % 100 <= 13) ? 'th' : ({1:'st',2:'nd',3:'rd'}[n % 10] || 'th');
+  return n + s;
+}
+/** Top-level category: "Interest · FD" → "Interest". */
+function mainCat(c){ return String(c || '').split(SUB_SEP)[0]; }
 function esc(s){
   return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -96,7 +134,19 @@ function hash(text, salt) {
 function pad2(h){ return h.length === 1 ? '0' + h : h; }
 
 // ============================ Google auth ============================
-var gToken = null, gExpiry = 0, tokenClient = null;
+/* The access token is kept in localStorage for its one-hour life. Before v10
+   it lived only in memory, so every reopen — every PIN unlock, every shared
+   screenshot — began with no token and went straight to the Google popup.
+   A longer-lived login would need a refresh token, and that needs a server
+   holding a client secret: a server that could then read users' sheets. So
+   one hour per token is the ceiling, and the work below is about never
+   asking when we don't strictly have to. */
+var savedTok = load(K.tok, null);
+var gToken = savedTok && savedTok.t || null, gExpiry = savedTok && savedTok.exp || 0;
+var tokenClient = null;
+
+function haveToken(){ return !!gToken && Date.now() < gExpiry - 60000; }
+function dropToken(){ gToken = null; gExpiry = 0; localStorage.removeItem(K.tok); }
 
 function loadGis() {
   if (window.google && window.google.accounts) return Promise.resolve();
@@ -114,7 +164,7 @@ function gisReady() {
   return !!(window.google && window.google.accounts && window.google.accounts.oauth2);
 }
 
-function askGoogle(interactive) {
+function askGoogle() {
   return new Promise(function (resolve, reject) {
     if (!tokenClient) {
       tokenClient = google.accounts.oauth2.initTokenClient({
@@ -127,6 +177,7 @@ function askGoogle(interactive) {
       if (res && res.access_token) {
         gToken = res.access_token;
         gExpiry = Date.now() + (Number(res.expires_in || 3600) * 1000);
+        save(K.tok, { t: gToken, exp: gExpiry });
         resolve(gToken);
       } else {
         reject(new Error(res && res.error ? res.error : 'no_token'));
@@ -135,29 +186,43 @@ function askGoogle(interactive) {
     tokenClient.error_callback = function (err) {
       reject(new Error((err && err.type) || 'popup_failed'));
     };
+    // prompt '' = show consent only if it was never given. login_hint names
+    // the account, so Google skips the account chooser and the popup closes
+    // by itself. ('consent' here forced the full screen on every renewal.)
+    var opts = { prompt: '' };
+    if (acct && acct.gEmail) opts.login_hint = acct.gEmail;
     try {
-      tokenClient.requestAccessToken({ prompt: interactive ? 'consent' : '' });
+      tokenClient.requestAccessToken(opts);
     } catch (e) { reject(e); }
   });
 }
 
 /**
- * Returns a usable access token, asking the user only when it has to.
+ * Returns a usable access token.
  *
- * The Google popup must open during the SAME synchronous turn as the click
- * that triggered it, or the browser blocks it. So when the Google library is
- * already loaded we call straight through with no promise in between —
- * awaiting anything first silently costs us the popup.
+ * interactive = false: only a token we already hold. Never opens a popup —
+ * it would be blocked outside a click anyway, or worse, open with no clear
+ * reason in the middle of a PIN unlock. Rejects with 'need_tap'.
+ *
+ * interactive = true: may open the Google popup. Call it ONLY from inside a
+ * click handler, synchronously. The popup must open in the same turn as the
+ * click, so when the library is loaded we call straight through — awaiting
+ * anything first silently costs us the popup.
  */
 function token(interactive) {
-  if (gToken && Date.now() < gExpiry - 60000) return Promise.resolve(gToken);
-  if (gisReady()) return askGoogle(interactive);
-  return loadGis().then(function () { return askGoogle(interactive); });
+  if (haveToken()) return Promise.resolve(gToken);
+  if (!interactive) return Promise.reject(new Error('need_tap'));
+  if (gisReady()) return askGoogle();
+  return loadGis().then(function () { return askGoogle(); });
 }
+
+function isNeedTap(e){ return /need_tap/.test(String(e && e.message)); }
 
 /** Plain-English version of Google's error codes. */
 function authReason(e) {
   var m = String((e && e.message) || '');
+  if (/need_tap/.test(m))
+    return 'Google needs a quick tap to reconnect.';
   if (/popup_closed|user_cancel|abort/i.test(m))
     return 'The Google window was closed before you finished.';
   if (/popup_failed|popup_blocked/i.test(m))
@@ -176,13 +241,10 @@ function gfetch(url, opts) {
     opts.headers.Authorization = 'Bearer ' + t;
     return fetch(url, opts);
   }).then(function (r) {
-    if (r.status === 401 || r.status === 403) {
-      gToken = null;                       // expired or revoked — ask once more
-      return token(true).then(function (t2) {
-        opts.headers.Authorization = 'Bearer ' + t2;
-        return fetch(url, opts);
-      });
-    }
+    // Expired or revoked. Asking again here would be outside any click, so
+    // the popup would be blocked — drop the token and let the caller offer
+    // a "tap to reconnect" instead.
+    if (r.status === 401) { dropToken(); throw new Error('need_tap'); }
     return r;
   }).then(function (r) {
     if (!r.ok) return r.text().then(function (b) {
@@ -462,7 +524,7 @@ function parseReceipt(text) {
     merchant: findMerchant(clean),
     category: findCategory(low, findMerchant(clean)),
     mode:     findMode(low),
-    when:     findWhen(clean)
+    when:     receiptDate(clean)
   };
 }
 
@@ -584,12 +646,61 @@ function findMode(low) {
   return 'UPI';
 }
 
-function findWhen(lines) {
+/**
+ * When the payment happened, as a Date — or null. This decides which month
+ * the entry counts in, so a September screenshot shared in October still
+ * lands in September. The old version only knew "24 Sep 2026" and fell back
+ * to today for everything else, including super.money's "September 24 at
+ * 1:47 AM" and Paytm's "24/09/2026".
+ *
+ * Numeric dates are read day-first, as Indian apps write them. A date with
+ * no year takes this year, or last year if that would put it in the future.
+ */
+var MON = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+var MON_RE = '(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?';
+
+function receiptDate(lines, now) {
+  now = now || new Date();
+  var dayMon = new RegExp('\\b(\\d{1,2})(?:st|nd|rd|th)?[\\s\\-\\/.]*' + MON_RE +
+                          '(?:[\\s\\-\\/.,]*(\\d{4}|\\d{2})(?![:\\d]))?', 'i');
+  var monDay = new RegExp('\\b' + MON_RE + '\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b' +
+                          '(?:,?\\s*(\\d{4})(?![:\\d]))?', 'i');
+  var numeric = /\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})\b/;
+  var isoDate = /\b(\d{4})-(\d{2})-(\d{2})\b/;
+
   for (var i = 0; i < lines.length; i++) {
-    var m = lines[i].match(/(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}).{0,6}?(\d{1,2}:\d{2}\s*(?:am|pm)?)?/i);
-    if (m) return (m[1] + (m[2] ? ' ' + m[2] : '')).trim();
+    var line = lines[i], m, d = null, mo = null, y = null;
+    if ((m = line.match(isoDate)))       { y = +m[1]; mo = +m[2] - 1; d = +m[3]; }
+    else if ((m = line.match(dayMon)))   { d = +m[1]; mo = MON[m[2].toLowerCase()]; y = m[3] ? +m[3] : null; }
+    else if ((m = line.match(monDay)))   { mo = MON[m[1].toLowerCase()]; d = +m[2]; y = m[3] ? +m[3] : null; }
+    else if ((m = line.match(numeric)))  { d = +m[1]; mo = +m[2] - 1; y = +m[3]; }
+    if (d === null || mo === null || d < 1 || d > 31 || mo < 0 || mo > 11) continue;
+
+    if (y !== null && y < 100) y += 2000;
+    var guessed = y === null;
+    if (guessed) y = now.getFullYear();
+    var out = new Date(y, mo, d, 12, 0);
+    if (out.getMonth() !== mo) continue;                    // 31 Sep and the like
+    if (guessed && out.getTime() > now.getTime() + 86400000) out.setFullYear(y - 1);
+
+    // The time is usually on the same line, sometimes on the next.
+    var t = timeIn(line) || (i + 1 < lines.length ? timeIn(lines[i + 1]) : null);
+    if (t) out.setHours(t[0], t[1], 0, 0);
+    return out;
   }
-  return '';
+  return null;
+}
+
+function timeIn(s) {
+  var m = String(s).match(/\b(\d{1,2}):(\d{2})(?::\d{2})?\s*([ap])?\.?\s*m?\b/i);
+  if (!m) return null;
+  var h = +m[1], mi = +m[2];
+  if (h > 23 || mi > 59) return null;
+  if (m[3]) {
+    var pm = m[3].toLowerCase() === 'p';
+    if (h === 12) h = pm ? 12 : 0; else if (pm) h += 12;
+  }
+  return [h, mi];
 }
 
 // ==== AUTO-CAPTURE FROM NOTIFICATIONS / BANK SMS ===========================
@@ -679,7 +790,8 @@ function doGoogle() {
   token(true).then(function () {
     return gfetch('https://www.googleapis.com/oauth2/v3/userinfo').catch(function(){ return {}; });
   }).then(function (info) {
-    acct = { mode:'google', email: (info && info.email) || '', sheetId:'', gid:null, pinHash:'' };
+    var em = (info && info.email) || '';
+    acct = { mode:'google', email: em, gEmail: em, sheetId:'', gid:null, pinHash:'' };
     save(K.acct, acct);
     return connectDrive();
   }).catch(function (e) {
@@ -699,6 +811,15 @@ function connectDrive() {
   var have = gToken && Date.now() < gExpiry - 60000;
 
   return (have ? Promise.resolve(gToken) : token(true))
+    .then(function () {
+      // Which Google account holds the sheet. Used as the login hint later,
+      // so renewing the token never shows the account chooser. Email users
+      // may pick a Google account different from their Paisa email.
+      if (acct.gEmail) return;
+      return gfetch('https://www.googleapis.com/oauth2/v3/userinfo').then(function (info) {
+        if (info && info.email) { acct.gEmail = info.email; save(K.acct, acct); }
+      }).catch(function(){});
+    })
     .then(function () { return ensureSheet(); })
     .then(function () { return pullAll(); })
     .then(function () {
@@ -756,10 +877,42 @@ function checkPin(p) {
   });
 }
 
+function unsyncedWarning() {
+  var n = pending();
+  return n ? '\n\n' + n + (n === 1 ? ' entry has' : ' entries have') +
+             ' not reached your sheet yet and will be lost from this phone.' : '';
+}
+
 function logout() {
-  if (!confirm('Log out? Your sheet stays in your Google Drive with all your data.')) return;
-  [K.acct, K.txns, K.shots].forEach(function (k) { localStorage.removeItem(k); });
+  if (!confirm('Log out? Your sheet stays in your Google Drive with all your data.' +
+               unsyncedWarning())) return;
+  [K.acct, K.txns, K.shots, K.tok].forEach(function (k) { localStorage.removeItem(k); });
   location.reload();
+}
+
+/** Wipes everything Paisa keeps on this phone and withdraws its Google
+    access. The sheet in Drive is untouched — signing in again finds it. */
+function resetAll() {
+  if (!confirm('Reset Paisa on this phone?\n\nThis removes your login, PIN, budgets and ' +
+               'recurring savings from this phone, and disconnects Google. Your sheet stays ' +
+               'in your Google Drive, and signing in again brings your entries back.' +
+               unsyncedWarning())) return;
+  var t = gToken;
+  Object.keys(K).forEach(function (k) { localStorage.removeItem(K[k]); });
+  localStorage.removeItem('p.rec');
+  var done = function () { location.reload(); };
+  if (t && gisReady() && google.accounts.oauth2.revoke) {
+    try { google.accounts.oauth2.revoke(t, done); } catch (e) { done(); }
+    setTimeout(done, 2500);          // never hang on Google
+  } else done();
+}
+
+function changePin() {
+  $('#setPinLede').textContent = 'Choose a new 4-digit PIN.';
+  $('#skipPin').textContent = 'Turn the PIN off';
+  clearPin('#setPinBox');
+  step('setpin');
+  clearPin('#setPinBox');
 }
 
 // ============================ sync ============================
@@ -771,21 +924,35 @@ function setPill() {
   var p = $('#syncPill'), n = pending();
   if (!navigator.onLine) { p.className = 'pill sync'; p.textContent = 'Offline'; return; }
   if (syncing)           { p.className = 'pill sync'; p.textContent = 'Syncing…'; return; }
+  if (!haveToken())      { p.className = 'pill sync tap';
+                           p.textContent = n ? n + ' to sync · tap' : 'Tap to sync'; return; }
   if (n)                 { p.className = 'pill sync'; p.textContent = n + ' to sync'; return; }
   p.className = 'pill ok'; p.textContent = 'Synced';
 }
 
-function sync() {
+/**
+ * interactive = true only from a click (Save, Sync now, the pill): then an
+ * expired token may be renewed with the popup. Every other caller — app
+ * open, PIN unlock, coming back online — syncs only if a token is already
+ * held, and otherwise leaves "Tap to sync" on the pill. Entries are safe in
+ * the offline queue either way.
+ */
+function sync(interactive) {
   if (syncing || !acct || !acct.sheetId || !navigator.onLine) { setPill(); return Promise.resolve(); }
+  if (!haveToken() && !interactive) { setPill(); return Promise.resolve(); }
   syncing = true; setPill();
 
-  var news = txns.filter(function (t) { return !t._s; });
-
-  return pushRows(news)
+  return token(!!interactive)                 // called synchronously: keeps the click
+    .then(function () {
+      return pushRows(txns.filter(function (t) { return !t._s; }));
+    })
     .then(function () { return pushShots(); })
     .then(function () { return pullAll(); })
     .catch(function (e) {
-      if (/API 40[13]/.test(e.message)) toast('Google access expired — reconnecting');
+      if (!interactive) return;               // background: the pill says enough
+      toast(/Google API/.test(e.message)
+        ? 'Could not reach your sheet. Your entries are safe on this phone.'
+        : authReason(e));
     })
     .then(function () { syncing = false; setPill(); renderAll(); });
 }
@@ -823,17 +990,53 @@ function byId(id) {
 }
 
 // ============================ add entry ============================
-var draft = { type:'Expense', category:'Food', mode:'UPI', shot:'' };
+var draft = { type:'Expense', category:'Food', sub:INTEREST[0], mode:'UPI', freq:'once', shot:'' };
 
-function buildChips() {
-  $('#catChips').innerHTML = CATS.map(function (c) {
+function chipsHtml(list, on) {
+  return list.map(function (c) {
     return '<button class="chip" type="button" data-v="' + esc(c) + '" aria-pressed="' +
-           (c === draft.category) + '">' + esc(c) + '</button>';
+           (c === on) + '">' + esc(c) + '</button>';
   }).join('');
-  $('#modeChips').innerHTML = MODES.map(function (m) {
-    return '<button class="chip" type="button" data-v="' + esc(m) + '" aria-pressed="' +
-           (m === draft.mode) + '">' + esc(m) + '</button>';
-  }).join('');
+}
+
+/** Redraws the form for the current type: its own categories, its own
+    payment words, and the extras only that type has. */
+function buildChips() {
+  var t = draft.type;
+  $('#v-add').setAttribute('data-type', t);
+  $('#catLabel').textContent = LABELS[t].cat;
+  $('#modeLabel').textContent = LABELS[t].mode;
+  $('#save').textContent = LABELS[t].save;
+  $('#catChips').innerHTML = chipsHtml(CATS[t], draft.category);
+  $('#modeChips').innerHTML = chipsHtml(MODES[t], draft.mode);
+
+  var interest = t === 'Income' && draft.category === 'Interest';
+  $('#subRow').classList.toggle('hide', !interest);
+  if (interest) $('#subChips').innerHTML = chipsHtml(INTEREST, draft.sub);
+
+  $('#freqRow').classList.toggle('hide', t !== 'Savings');
+  $$('#freqSeg button').forEach(function (b) {
+    b.setAttribute('aria-pressed', String(b.dataset.v === draft.freq));
+  });
+  freqHint();
+}
+
+function freqHint() {
+  var el = $('#freqHint');
+  if (draft.type !== 'Savings' || draft.freq !== 'monthly') { el.textContent = ''; return; }
+  var d = $('#dt').value ? new Date($('#dt').value + 'T12:00') : new Date();
+  el.textContent = 'Adds itself on the ' + ordinal(d.getDate()) + ' of every month from ' +
+    d.toLocaleDateString('en-IN', { month:'long' }) + '. Stop it any time in Settings.';
+}
+
+function setType(t) {
+  if (TYPES.indexOf(t) < 0) return;
+  draft.type = t;
+  draft.category = CATS[t][0];
+  draft.mode = MODES[t][0];
+  draft.freq = 'once';
+  $$('#typeSeg button').forEach(function (x) { x.setAttribute('aria-pressed', String(x.dataset.v === t)); });
+  buildChips();
 }
 
 function chipGroup(sel, key) {
@@ -841,6 +1044,7 @@ function chipGroup(sel, key) {
     var b = e.target.closest('.chip'); if (!b) return;
     draft[key] = b.dataset.v;
     $$(sel + ' .chip').forEach(function (c) { c.setAttribute('aria-pressed', String(c === b)); });
+    if (key === 'category') buildChips();    // Interest opens its own options
   });
 }
 
@@ -857,18 +1061,36 @@ function resetForm() {
   draft.shot = '';
   $('#shotPrev').classList.add('hide'); $('#shotClear').classList.add('hide');
   $('#shotBtn').textContent = 'Attach receipt';
+  // Back to one-time after every save, so a monthly rule is never made twice
+  // by accident.
+  draft.freq = 'once';
+  buildChips();
 }
 
 function saveEntry() {
   var amt = parseFloat(String($('#amt').value).replace(/[^0-9.]/g, ''));
   if (!isFinite(amt) || amt <= 0) { toast('Enter an amount'); $('#amt').focus(); return; }
 
+  var day = $('#dt').value || nowLocal().d, time = $('#tm').value || nowLocal().t;
+  var cat = draft.category;
+  if (draft.type === 'Income' && cat === 'Interest') cat = 'Interest' + SUB_SEP + draft.sub;
+  var remarks = String($('#rem').value || '').trim();
+
   var id = uid();
+  if (draft.type === 'Savings' && draft.freq === 'monthly') {
+    // This entry is the first month of the rule. Its id is derived from the
+    // rule and month, so the generator can tell it already exists.
+    var rule = { id: uid(), category: cat, amount: amt, mode: draft.mode, remarks: remarks,
+                 day: +day.slice(8, 10), time: time, last: day.slice(0, 7) };
+    recur.push(rule); save(K.recur, recur);
+    id = recId(rule, rule.last);
+  }
+
   var row = {
     id: id,
-    ts: ($('#dt').value || nowLocal().d) + 'T' + ($('#tm').value || nowLocal().t) + ':00',
-    type: draft.type, category: draft.category, amount: amt,
-    mode: draft.mode, remarks: String($('#rem').value || '').trim(),
+    ts: day + 'T' + time + ':00',
+    type: draft.type, category: cat, amount: amt,
+    mode: draft.mode, remarks: remarks,
     screenshot: '', _s: 0
   };
   if (draft.shot) { shots[id] = draft.shot; save(K.shots, shots); }
@@ -877,12 +1099,55 @@ function saveEntry() {
   txns.sort(function (a,b) { return String(b.ts).localeCompare(String(a.ts)); });
   save(K.txns, txns);
 
-  var what = draft.type;
+  var what = draft.type, month = ym(row.ts);
   resetForm();
   scanResult('');
-  toast(what + ' ' + money(amt) + ' saved');
+  toast(what + ' ' + money(amt) + ' saved' +
+        (month !== ym(new Date()) ? ' in ' + monthName(row.ts).split(' ')[0] : ''));
   renderAll();
-  sync();
+  sync(true);                                 // a click: may reconnect if it must
+}
+
+// ============================ recurring savings ============================
+/* Rebuilt on the phone (v10). The old daily server trigger could not reach a
+   sheet in someone else's Drive. Instead, each time the app opens, every
+   rule adds the months it has not added yet, once that month's day has
+   come. rule.last records the newest month added, so deleting one month's
+   entry never brings it back. Rules live on this phone, like budgets. */
+function recId(rule, month) { return 'rec-' + rule.id + '-' + month; }
+
+function runRecurring() {
+  var now = new Date(), thisMonth = ym(now), added = 0;
+  recur.forEach(function (rule) {
+    var m = ymShift(rule.last, 1);
+    while (m <= thisMonth) {
+      var d = Math.min(rule.day, daysIn(m));
+      if (m === thisMonth && now.getDate() < d) break;
+      var id = recId(rule, m);
+      if (!byId(id)) {
+        txns.push({ id: id, ts: m + '-' + pad(d) + 'T' + (rule.time || '09:00') + ':00',
+                    type: 'Savings', category: rule.category, amount: rule.amount,
+                    mode: rule.mode, remarks: rule.remarks, screenshot: '', _s: 0 });
+        added++;
+      }
+      rule.last = m;
+      m = ymShift(m, 1);
+    }
+  });
+  if (!added) { if (recur.length) save(K.recur, recur); return 0; }
+  txns.sort(function (a,b) { return String(b.ts).localeCompare(String(a.ts)); });
+  save(K.txns, txns);
+  save(K.recur, recur);
+  return added;
+}
+
+function stopRule(id) {
+  var r = recur.filter(function (x) { return x.id === id; })[0];
+  if (!r || !confirm('Stop "' + (r.remarks || r.category) + '"?\n\nEntries already added stay; ' +
+                     'no new ones will be added.')) return;
+  recur = recur.filter(function (x) { return x.id !== id; });
+  save(K.recur, recur);
+  renderSettings();
 }
 
 function shrink(file, maxPx, quality) {
@@ -941,7 +1206,6 @@ function scanReceipt(file) {
 
   go('add');
   scanResult('');
-  scanBusy(true, 'Reading your screenshot…');
 
   shrink(file, 1100, 0.72).then(function (small) {
     draft.shot = small;
@@ -951,8 +1215,23 @@ function scanReceipt(file) {
     $('#shotBtn').textContent = 'Replace receipt';
     return shrink(file, 1600, 0.82);
   }).then(function (big) {
-    return ocr(big);
-  }).then(function (text) {
+    if (haveToken()) return readScan(big);
+    // A shared screenshot arrives with no click behind it, so a Google popup
+    // here would be blocked — or, before v10, appeared out of nowhere. Hold
+    // the image and let the user's tap do the reconnecting.
+    scanResult('<div><b>Screenshot attached</b><br>Tap below to read the amount and date from it.</div>' +
+               '<button class="btn sm" id="scanGo" type="button" style="margin-top:10px">Read receipt</button>');
+    $('#scanGo').onclick = function () {
+      token(true).then(function () { readScan(big); })
+        .catch(function (e) { scanResult('<div><b>Not connected</b><br>' + esc(authReason(e)) + '</div>'); });
+    };
+  }).catch(function () { toast('Could not read that image'); });
+}
+
+function readScan(big) {
+  scanResult('');
+  scanBusy(true, 'Reading your screenshot…');
+  return ocr(big).then(function (text) {
     scanBusy(false);
     if (!text || text.replace(/\s/g,'').length < 4) {
       scanResult('<div><b>Could not read it</b><br>No text found in that image. ' +
@@ -962,24 +1241,26 @@ function scanReceipt(file) {
     applyScan(parseReceipt(text));
   }).catch(function (e) {
     scanBusy(false);
-    scanResult('<div><b>Scan failed</b><br>' + esc(String(e.message).slice(0,140)) +
+    scanResult('<div><b>Scan failed</b><br>' + esc(authReason(e).slice(0,140)) +
                '<br>The receipt is attached — type the amount and save as normal.</div>');
   });
 }
 
 function applyScan(r) {
-  var got = [];
+  var got = [], cats = CATS[draft.type];
   if (r.amount) { $('#amt').value = r.amount; got.push('amount ' + money(r.amount)); }
-  if (r.category && CATS.indexOf(r.category) > -1) { draft.category = r.category; got.push('category ' + r.category); }
-  if (r.mode && MODES.indexOf(r.mode) > -1) draft.mode = r.mode;
+  if (r.category && cats.indexOf(r.category) > -1) { draft.category = r.category; got.push('category ' + r.category); }
+  if (r.mode && MODES[draft.type].indexOf(r.mode) > -1) draft.mode = r.mode;
   buildChips();
   if (r.merchant) $('#rem').value = r.merchant;
 
-  var when = r.when ? new Date(r.when) : null;
+  var when = r.when, note = '';
   if (when && !isNaN(when.getTime())) {
-    $('#dt').value = when.getFullYear() + '-' + pad(when.getMonth()+1) + '-' + pad(when.getDate());
+    $('#dt').value = ymd(when);
     $('#tm').value = pad(when.getHours()) + ':' + pad(when.getMinutes());
-    got.push('date & time');
+    got.push('date ' + when.toLocaleDateString('en-IN', { day:'numeric', month:'short' }));
+    if (ym(when) !== ym(new Date()))
+      note = ' It will count in <b>' + esc(monthName(when)) + '</b>, the month it was paid.';
   }
 
   if (!got.length) {
@@ -988,7 +1269,7 @@ function applyScan(r) {
     return;
   }
   scanResult('<div><b>Read ' + esc(got.join(', ')) + '</b><br>' +
-             'Check it below and fix anything wrong, then tap Save entry.</div>');
+             'Check it below and fix anything wrong, then tap Save.' + note + '</div>');
   if (!r.amount) $('#amt').focus();
 }
 
@@ -1007,49 +1288,96 @@ function takeSharedImage() {
   }).catch(function(){});
 }
 
+// ============================ the month being looked at ============================
+/* Stats and History both show one month at a time, and share it: step back
+   to September on Stats and History is on September too. An entry belongs
+   to the month of its own date — never the month it was typed in. */
+var viewMonth = ym(new Date());
+var selDay = '';                  // 'YYYY-MM-DD' picked on the calendar, or ''
+
+function inMonth(k) { return txns.filter(function (t) { return ym(t.ts) === k; }); }
+
+function renderMonthNav() {
+  var label = monthName(ymDate(viewMonth));
+  $$('.monthnav b').forEach(function (b) { b.textContent = label; });
+  $$('.monthnav .today').forEach(function (b) {
+    b.classList.toggle('hide', viewMonth === ym(new Date()));
+  });
+}
+
+function stepMonth(n) {
+  viewMonth = n === 0 ? ym(new Date()) : ymShift(viewMonth, n);
+  selDay = '';
+  renderAll();
+}
+
 // ============================ stats ============================
 function sum(list, type) {
   return list.reduce(function (a,t) { return a + (t.type === type ? Number(t.amount)||0 : 0); }, 0);
 }
 
+function byCategory(list, type) {
+  var out = {};
+  list.forEach(function (t) {
+    if (t.type !== type) return;
+    out[t.category] = (out[t.category] || 0) + (Number(t.amount)||0);
+  });
+  return out;
+}
+
+function barsHtml(map, color, emptyText) {
+  var rows = Object.keys(map).map(function (c) { return {c:c, v:map[c]}; })
+                   .sort(function (a,b) { return b.v - a.v; });
+  if (!rows.length) return '<div class="empty">' + esc(emptyText) + '</div>';
+  var max = rows[0].v || 1;
+  return rows.map(function (r) {
+    return '<div class="bar-row"><div class="nm">' + esc(r.c) + '</div>' +
+           '<div class="tr"><i style="width:' + Math.max(2,(r.v/max)*100) + '%;background:var(--' +
+           color + ')"></i></div><div class="vl">' + moneyShort(r.v) + '</div></div>';
+  }).join('');
+}
+
 function renderStats() {
-  var key = ym(new Date());
-  var list = txns.filter(function (t) { return ym(t.ts) === key; });
+  renderMonthNav();
+  var key = viewMonth, isNow = key === ym(new Date());
+  var mName = monthName(ymDate(key)).split(' ')[0];
+  var list = inMonth(key);
   var exp = sum(list,'Expense'), inc = sum(list,'Income'), sav = sum(list,'Savings');
 
   $('#sSpent').textContent = money(exp);
-  $('#sMonth').textContent = monthName(new Date());
+  $('#sMonth').textContent = 'spent in ' + monthName(ymDate(key));
   $('#kInc').textContent = moneyShort(inc);
   $('#kExp').textContent = moneyShort(exp);
   $('#kSav').textContent = moneyShort(sav);
+  var left = inc - exp - sav;
+  $('#sNet').innerHTML = inc
+    ? 'Left over after spending and saving: <b style="color:var(--' + (left < 0 ? 'expense' : 'income') +
+      ')">' + (left < 0 ? '−' : '') + money(Math.abs(left)) + '</b>' +
+      (sav > 0 ? ' · saved ' + Math.round(sav / inc * 100) + '% of income' : '')
+    : 'Add your income to see what is left over.';
 
   var limit = Number(bud.TOTAL) || 0, meter = $('#sMeter'), alerts = [];
+  var byCat = byCategory(list, 'Expense');
   if (limit > 0) {
     var pct = exp / limit;
     meter.style.width = Math.min(100, pct*100) + '%';
     meter.className = pct >= 1 ? 'crit' : (pct >= 0.8 ? 'warn' : '');
     $('#sLeft').textContent = money(Math.max(0, limit - exp));
     if (pct >= 1) alerts.push(['crit','Over budget',
-      'You have spent ' + money(exp) + ' of your ' + money(limit) + ' limit — ' +
+      'You spent ' + money(exp) + ' of your ' + money(limit) + ' limit — ' +
       money(exp - limit) + ' over.']);
-    else if (pct >= 0.8) alerts.push(['warn', Math.round(pct*100) + '% of budget used',
-      money(limit - exp) + ' left for the rest of ' + monthName(new Date()).split(' ')[0] + '.']);
+    else if (pct >= 0.8 && isNow) alerts.push(['warn', Math.round(pct*100) + '% of budget used',
+      money(limit - exp) + ' left for the rest of ' + mName + '.']);
   } else {
     meter.style.width = '0'; meter.className = '';
     $('#sLeft').textContent = '—';
   }
-
-  var byCat = {};
-  list.forEach(function (t) {
-    if (t.type !== 'Expense') return;
-    byCat[t.category] = (byCat[t.category] || 0) + (Number(t.amount)||0);
-  });
   Object.keys(bud).forEach(function (c) {
     if (c === 'TOTAL' || !bud[c]) return;
     var spent = byCat[c] || 0;
     if (spent >= bud[c]) alerts.push(['crit', c + ' over limit',
       money(spent) + ' spent against a ' + money(bud[c]) + ' limit.']);
-    else if (spent >= bud[c]*0.8) alerts.push(['warn', c + ' nearly used up',
+    else if (spent >= bud[c]*0.8 && isNow) alerts.push(['warn', c + ' nearly used up',
       money(bud[c]-spent) + ' left of ' + money(bud[c]) + '.']);
   });
   $('#alerts').innerHTML = alerts.slice(0,3).map(function (a) {
@@ -1057,32 +1385,34 @@ function renderStats() {
            '</span><div><b>' + esc(a[1]) + '</b><br>' + esc(a[2]) + '</div></div>';
   }).join('');
 
-  var now = new Date();
-  var days = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
-  var avg = exp / now.getDate();
+  // Pace: a running month projects forward; a finished one just averages.
+  var days = daysIn(key), today = new Date().getDate();
+  var avg = exp / (isNow ? today : days);
   $('#pAvg').textContent = money(avg);
-  $('#pProj').textContent = money(avg * days);
+  $('#pProj').textContent = money(isNow ? avg * days : exp);
+  $('#pProjL').textContent = isNow ? 'projected this month' : 'total for ' + mName;
 
-  var rows = Object.keys(byCat).map(function (c) { return {c:c, v:byCat[c]}; })
-                   .sort(function (a,b) { return b.v - a.v; });
-  var max = rows.length ? rows[0].v : 1;
-  $('#catBars').innerHTML = rows.length ? rows.map(function (r) {
-    return '<div class="bar-row"><div class="nm">' + esc(r.c) + '</div>' +
-           '<div class="tr"><i style="width:' + Math.max(2,(r.v/max)*100) + '%"></i></div>' +
-           '<div class="vl">' + moneyShort(r.v) + '</div></div>';
-  }).join('') : '<div class="empty">No spending logged this month yet.</div>';
+  $('#catTitle').textContent = 'Where it went — ' + mName;
+  $('#catBars').innerHTML = barsHtml(byCat, 'expense', 'No spending logged in ' + mName + '.');
+  $('#incBars').innerHTML = barsHtml(byCategory(list, 'Income'), 'income', 'No income logged in ' + mName + '.');
+  $('#savBars').innerHTML = barsHtml(byCategory(list, 'Savings'), 'savings', 'Nothing saved in ' + mName + ' yet.');
 
+  // Six months ending at the month in view, all three types side by side.
   var months = [];
   for (var i = 5; i >= 0; i--) {
-    var d = new Date(now.getFullYear(), now.getMonth()-i, 1);
-    months.push({ label: d.toLocaleDateString('en-IN',{month:'short'}),
-                  v: sum(txns.filter(function (t) { return ym(t.ts) === ym(d); }), 'Expense') });
+    var k = ymShift(key, -i), l = inMonth(k);
+    months.push({ k: k, label: ymDate(k).toLocaleDateString('en-IN',{month:'short'}),
+                  e: sum(l,'Expense'), n: sum(l,'Income'), s: sum(l,'Savings') });
   }
-  var tmax = Math.max.apply(null, months.map(function (x) { return x.v; }).concat([1]));
+  var tmax = Math.max.apply(null, months.map(function (x) { return Math.max(x.e, x.n, x.s); }).concat([1]));
+  var h = function (v) { return Math.max(v ? 3 : 0, (v/tmax)*100); };
   $('#trend').innerHTML = months.map(function (x, i) {
-    return '<div class="col' + (i===5?' cur':'') + '" title="' + esc(x.label) + ' ' + money(x.v) + '">' +
-           '<div class="stack"><i style="height:' + Math.max(2,(x.v/tmax)*100) + '%"></i></div>' +
-           '<span>' + esc(x.label) + '</span></div>';
+    return '<button class="col' + (i===5?' cur':'') + '" type="button" data-m="' + x.k + '" title="' +
+           esc(x.label) + ': income ' + money(x.n) + ', spent ' + money(x.e) + ', saved ' + money(x.s) + '">' +
+           '<div class="stack"><i class="n" style="height:' + h(x.n) + '%"></i>' +
+           '<i class="e" style="height:' + h(x.e) + '%"></i>' +
+           '<i class="s" style="height:' + h(x.s) + '%"></i></div>' +
+           '<span>' + esc(x.label) + '</span></button>';
   }).join('');
 }
 
@@ -1092,14 +1422,15 @@ function txHtml(t) {
   var when = isNaN(d.getTime()) ? '' :
     d.toLocaleDateString('en-IN',{day:'2-digit',month:'short'}) + ' · ' +
     d.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
+  var sign = t.type === 'Income' ? '+' : (t.type === 'Savings' ? '' : '−');
   return '<div class="tx" data-id="' + esc(t.id) + '">' +
-    '<div class="ic">' + esc(String(t.category||'?').slice(0,1).toUpperCase()) + '</div>' +
+    '<div class="ic ' + esc(t.type) + '">' + esc(String(t.category||'?').slice(0,1).toUpperCase()) + '</div>' +
     '<div class="mid"><div class="t1">' + esc(t.remarks || t.category) + '</div>' +
     '<div class="t2">' + esc(t.category) + ' · ' + esc(t.mode||'') + ' · ' + when +
+    (String(t.id).indexOf('rec-') === 0 ? ' · ↻' : '') +
     ((t.screenshot || shots[t.id]) ? ' · 📎' : '') + '</div></div>' +
     (!t._s ? '<div class="dot" title="not synced"></div>' : '') +
-    '<div class="amt ' + esc(t.type) + '">' + (t.type==='Income'?'+':'−') +
-    money(t.amount).slice(1) + '</div></div>';
+    '<div class="amt ' + esc(t.type) + '">' + sign + money(t.amount).slice(1) + '</div></div>';
 }
 
 function renderRecent() {
@@ -1110,28 +1441,84 @@ function renderRecent() {
 
 var filter = { type:'', cat:'' };
 
+function matchesFilter(t) {
+  if (filter.type && t.type !== filter.type) return false;
+  if (filter.cat && mainCat(t.category) !== filter.cat) return false;
+  return true;
+}
+
+/** Month grid, Monday first. Each day shows what was spent, and a dot each
+    for income and savings. Tap a day to list just that day. */
+function renderCal() {
+  var first = ymDate(viewMonth), n = daysIn(viewMonth);
+  var lead = (first.getDay() + 6) % 7;
+  var per = {};
+  inMonth(viewMonth).forEach(function (t) {
+    if (!matchesFilter(t)) return;
+    var k = ymd(t.ts);
+    var p = per[k] || (per[k] = { e:0, n:0, s:0 });
+    if (t.type === 'Expense') p.e += Number(t.amount)||0;
+    else if (t.type === 'Income') p.n += Number(t.amount)||0;
+    else p.s += Number(t.amount)||0;
+  });
+  var todayK = ymd(new Date());
+  var html = ['M','T','W','T','F','S','S'].map(function (w) { return '<div class="wd">' + w + '</div>'; }).join('');
+  for (var i = 0; i < lead; i++) html += '<div></div>';
+  for (var d = 1; d <= n; d++) {
+    var k = viewMonth + '-' + pad(d), p = per[k];
+    html += '<button type="button" class="day' + (k === todayK ? ' today' : '') + (k === selDay ? ' sel' : '') +
+            (p ? ' has' : '') + '" data-d="' + k + '" aria-pressed="' + (k === selDay) + '">' +
+            '<span class="dn">' + d + '</span>' +
+            (p && p.e ? '<span class="de">' + moneyShort(p.e).slice(1) + '</span>' : '') +
+            '<span class="dots">' + (p && p.n ? '<i class="n"></i>' : '') + (p && p.s ? '<i class="s"></i>' : '') +
+            '</span></button>';
+  }
+  $('#cal').innerHTML = html;
+}
+
 function renderHist() {
+  renderMonthNav();
+  renderCal();
   var q = String($('#q').value || '').toLowerCase().trim();
+  // A search looks across every month — you are hunting for something.
+  // Otherwise the list is the month (or day) on the calendar.
   var list = txns.filter(function (t) {
-    if (filter.type && t.type !== filter.type) return false;
-    if (filter.cat && t.category !== filter.cat) return false;
-    if (!q) return true;
+    if (!matchesFilter(t)) return false;
+    if (!q) return selDay ? ymd(t.ts) === selDay : ym(t.ts) === viewMonth;
     return String(t.remarks||'').toLowerCase().indexOf(q) > -1 ||
            String(t.category||'').toLowerCase().indexOf(q) > -1 ||
            String(t.mode||'').toLowerCase().indexOf(q) > -1 ||
            String(t.amount).indexOf(q) > -1;
   });
+
+  var head;
+  if (q) head = 'All months · ' + list.length + ' found';
+  else if (selDay) head = new Date(selDay + 'T12:00').toLocaleDateString('en-IN',
+         { weekday:'short', day:'numeric', month:'short' }) + ' · ' + list.length +
+         (list.length === 1 ? ' entry' : ' entries') + ' <button class="link inline" id="clearDay" type="button">Show whole month</button>';
+  else head = monthName(ymDate(viewMonth)) + ' · ' + list.length + (list.length === 1 ? ' entry' : ' entries');
+  var tot = '';
+  if (list.length) {
+    var e = sum(list,'Expense'), n = sum(list,'Income'), s = sum(list,'Savings');
+    tot = '<div class="totline">' +
+      (n ? '<span style="color:var(--income)">+' + moneyShort(n).slice(1) + ' in</span>' : '') +
+      (e ? '<span style="color:var(--expense)">−' + moneyShort(e).slice(1) + ' out</span>' : '') +
+      (s ? '<span style="color:var(--savings)">' + moneyShort(s).slice(1) + ' saved</span>' : '') + '</div>';
+  }
+  $('#histHead').innerHTML = head + tot;
   $('#histList').innerHTML = list.length ? list.slice(0,300).map(txHtml).join('')
-    : '<div class="empty">No entries match.</div>';
+    : '<div class="empty">' + (q ? 'No entries match.' : 'Nothing logged ' +
+        (selDay ? 'on this day.' : 'in ' + monthName(ymDate(viewMonth)).split(' ')[0] + '.')) + '</div>';
 }
 
 function buildFilters() {
-  var opts = [['','All']]
-    .concat(['Expense','Income','Savings'].map(function (t) { return ['t:'+t, t]; }))
-    .concat(CATS.map(function (c) { return ['c:'+c, c]; }));
+  // Category chips follow the type picked, so the row stays short and every
+  // chip means something for that type.
+  var opts = [['','All']].concat(TYPES.map(function (t) { return ['t:'+t, t]; }));
+  if (filter.type) opts = opts.concat(CATS[filter.type].map(function (c) { return ['c:'+c, c]; }));
   $('#filterChips').innerHTML = opts.map(function (o) {
     var on = (o[0] === '' && !filter.type && !filter.cat) ||
-             (filter.type && o[0] === 't:'+filter.type) ||
+             (o[0] === 't:'+filter.type && !filter.cat) ||
              (filter.cat && o[0] === 'c:'+filter.cat);
     return '<button class="chip" type="button" data-v="' + esc(o[0]) + '" aria-pressed="' +
            (!!on) + '">' + esc(o[1]) + '</button>';
@@ -1149,7 +1536,8 @@ function openTx(id) {
     money(t.amount) + '</div></div>' +
     '<p style="color:var(--ink-2);font-size:13.5px;margin:10px 0 16px">' +
     esc(t.type) + ' · ' + esc(t.category) + ' · ' + esc(t.mode||'—') + '<br>' +
-    (isNaN(d.getTime()) ? '' : esc(d.toLocaleString('en-IN'))) + '</p>' +
+    (isNaN(d.getTime()) ? '' : esc(d.toLocaleString('en-IN'))) +
+    (String(t.id).indexOf('rec-') === 0 ? '<br>Added by a monthly saving' : '') + '</p>' +
     (img ? '<img src="' + esc(img) + '" style="width:100%;border-radius:12px;margin-bottom:14px" alt="receipt">' : '') +
     '<button class="btn danger sm" id="txDel">Delete entry</button>' +
     '<button class="btn ghost sm" id="txNo" style="margin-top:8px">Close</button></div>';
@@ -1170,18 +1558,28 @@ function openTx(id) {
 // ============================ settings ============================
 function renderSettings() {
   $('#bTotal').value = bud.TOTAL || '';
-  $('#bCats').innerHTML = CATS.map(function (c) {
+  $('#bCats').innerHTML = CATS.Expense.map(function (c) {
     return '<label class="f"><span>' + esc(c) + '</span>' +
       '<input class="in bcat" data-c="' + esc(c) + '" type="number" inputmode="numeric" ' +
       'placeholder="no limit" value="' + (bud[c] || '') + '"></label>';
   }).join('');
 
-  $('#recList').innerHTML = '<div class="empty">Recurring entries are coming back in the next update.</div>';
+  $('#recList').innerHTML = recur.length ? recur.map(function (r) {
+    return '<div class="tx"><div class="ic Savings">↻</div>' +
+      '<div class="mid"><div class="t1">' + esc(r.remarks || r.category) + '</div>' +
+      '<div class="t2">' + esc(r.category) + ' · ' + money(r.amount) + ' on the ' + ordinal(r.day) +
+      ' of every month</div></div>' +
+      '<button class="btn ghost sm stopRule" type="button" data-id="' + esc(r.id) +
+      '" style="width:auto;padding:7px 12px">Stop</button></div>';
+  }).join('') : '<div class="empty" style="padding:14px 0">No monthly savings yet. Add a saving and ' +
+                'choose “Every month” — an SIP or RD, say.</div>';
 
   $('#acct').textContent = acct
     ? (acct.email || 'Signed in') + ' · ' + (acct.mode === 'google' ? 'Google' : 'Email') +
+      (acct.gEmail && acct.gEmail !== acct.email ? ' · Drive: ' + acct.gEmail : '') +
       ' · ' + txns.length + ' entries · app ' + APP_VERSION
     : '';
+  $('#pinBtn').textContent = acct && acct.pinHash ? 'Change PIN' : 'Set a PIN';
   var link = acct && acct.sheetId
     ? 'https://docs.google.com/spreadsheets/d/' + acct.sheetId : '#';
   $('#openSheet').href = link;
@@ -1247,8 +1645,9 @@ function openApp() {
   $('#app').classList.remove('hide');
   buildChips();
   resetForm();
+  runRecurring();
   renderAll();
-  sync();
+  sync();                      // no popup: only if a token is still held
   takeSharedImage();
   if (location.search.indexOf('fix=1') > -1) {
     history.replaceState(null, '', location.pathname);
@@ -1291,11 +1690,16 @@ function init() {
   // --- app ---
   chipGroup('#catChips','category');
   chipGroup('#modeChips','mode');
+  chipGroup('#subChips','sub');
   $('#typeSeg').addEventListener('click', function (e) {
-    var b = e.target.closest('button'); if (!b) return;
-    draft.type = b.dataset.v;
-    $$('#typeSeg button').forEach(function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+    var b = e.target.closest('button'); if (b) setType(b.dataset.v);
   });
+  $('#freqSeg').addEventListener('click', function (e) {
+    var b = e.target.closest('button'); if (!b) return;
+    draft.freq = b.dataset.v;
+    buildChips();
+  });
+  $('#dt').addEventListener('change', freqHint);
 
   $('#save').addEventListener('click', saveEntry);
   $('#scanBtn').addEventListener('click', function () { $('#scanIn').click(); });
@@ -1318,6 +1722,17 @@ function init() {
   });
 
   $('#q').addEventListener('input', renderHist);
+  document.addEventListener('click', function (e) {
+    var m = e.target.closest('.monthnav button');
+    if (m) { stepMonth(+m.dataset.step); return; }
+    var c = e.target.closest('#trend .col');
+    if (c) { viewMonth = c.dataset.m; selDay = ''; renderAll(); return; }
+    var d = e.target.closest('#cal .day');
+    if (d) { selDay = selDay === d.dataset.d ? '' : d.dataset.d; renderHist(); return; }
+    if (e.target.closest('#clearDay')) { selDay = ''; renderHist(); return; }
+    var s = e.target.closest('.stopRule');
+    if (s) stopRule(s.dataset.id);
+  });
   $('#filterChips').addEventListener('click', function (e) {
     var b = e.target.closest('.chip'); if (!b) return;
     var v = b.dataset.v;
@@ -1328,18 +1743,24 @@ function init() {
   });
 
   $('#bSave').addEventListener('click', saveBudgets);
-  $('#recAdd').addEventListener('click', function () { toast('Recurring entries return in the next update'); });
-  $('#syncNow').addEventListener('click', function () { sync().then(function(){ toast('Synced'); }); });
-  $('#exportCsv').addEventListener('click', exportCsv);
-  $('#setApi').addEventListener('click', function () {
-    alert('Your data lives in your own Google Drive — there is no server to point at any more.');
+  $('#recAdd').addEventListener('click', function () {
+    go('add'); setType('Savings'); draft.freq = 'monthly'; buildChips(); $('#amt').focus();
   });
+  $('#syncNow').addEventListener('click', function () {
+    sync(true).then(function(){ if (haveToken() && !pending()) toast('Synced'); });
+  });
+  $('#syncPill').addEventListener('click', function () { if (!syncing) sync(true); });
+  $('#exportCsv').addEventListener('click', exportCsv);
+  $('#pinBtn').addEventListener('click', changePin);
+  $('#resetAll').addEventListener('click', resetAll);
   $('#logout').addEventListener('click', logout);
 
   window.addEventListener('online', function () { setPill(); sync(); });
   window.addEventListener('offline', setPill);
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden && acct && acct.sheetId) sync();
+    if (document.hidden || !acct || !acct.sheetId) return;
+    if (runRecurring()) renderAll();   // a new month may have begun
+    sync();
   });
 
   // --- where do we land? ---
@@ -1359,6 +1780,10 @@ function init() {
     }).catch(function(){});
   }
 }
+
+// Tests set window.__PAISA_TEST__ before loading this file to reach the
+// parser directly. Nothing in the app reads it.
+if (window.__PAISA_TEST__) window.__PAISA_TEST__ = { parseReceipt: parseReceipt, receiptDate: receiptDate };
 
 document.addEventListener('DOMContentLoaded', init);
 })();
