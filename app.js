@@ -10,7 +10,7 @@
 (function () {
 'use strict';
 
-var APP_VERSION = 'v10';
+var APP_VERSION = 'v11';
 
 /* Your Google OAuth client. Safe to be public — it identifies the app, it
    grants nothing on its own. */
@@ -858,6 +858,14 @@ function wirePin(sel, onFull) {
   });
 }
 
+/* Unlocked for the life of this tab. sessionStorage survives a refresh (and
+   the reload after an app update) but is gone once the app is closed, so the
+   PIN still guards every fresh open — just not every pull-to-refresh. */
+var UNLOCK = 'p.unlocked';
+function markUnlocked() { try { sessionStorage.setItem(UNLOCK, '1'); } catch (e) {} }
+function isUnlocked() { try { return sessionStorage.getItem(UNLOCK) === '1'; } catch (e) { return false; } }
+function forgetUnlock() { try { sessionStorage.removeItem(UNLOCK); } catch (e) {} }
+
 function savePin(p) {
   if (p.length !== 4) return;
   busy(true, 'Saving…');
@@ -865,14 +873,16 @@ function savePin(p) {
     acct.pinHash = h;
     save(K.acct, acct);
     busy(false);
+    markUnlocked();
     openApp();
+    if (pinFromSettings) { pinFromSettings = false; go('set'); toast('PIN saved'); }
   });
 }
 
 function checkPin(p) {
   if (p.length !== 4) return;
   hash(p, acct.email || 'local').then(function (h) {
-    if (h === acct.pinHash) { $('#lockErr').textContent = ''; openApp(); }
+    if (h === acct.pinHash) { $('#lockErr').textContent = ''; markUnlocked(); openApp(); }
     else { $('#lockErr').textContent = 'Wrong PIN'; clearPin('#lockBox'); }
   });
 }
@@ -887,6 +897,7 @@ function logout() {
   if (!confirm('Log out? Your sheet stays in your Google Drive with all your data.' +
                unsyncedWarning())) return;
   [K.acct, K.txns, K.shots, K.tok].forEach(function (k) { localStorage.removeItem(k); });
+  forgetUnlock();
   location.reload();
 }
 
@@ -900,6 +911,7 @@ function resetAll() {
   var t = gToken;
   Object.keys(K).forEach(function (k) { localStorage.removeItem(K[k]); });
   localStorage.removeItem('p.rec');
+  forgetUnlock();
   var done = function () { location.reload(); };
   if (t && gisReady() && google.accounts.oauth2.revoke) {
     try { google.accounts.oauth2.revoke(t, done); } catch (e) { done(); }
@@ -907,7 +919,10 @@ function resetAll() {
   } else done();
 }
 
+var pinFromSettings = false;    // return to Settings, not Add, afterwards
+
 function changePin() {
+  pinFromSettings = true;
   $('#setPinLede').textContent = 'Choose a new 4-digit PIN.';
   $('#skipPin').textContent = 'Turn the PIN off';
   clearPin('#setPinBox');
@@ -1054,10 +1069,21 @@ function nowLocal() {
            t: pad(d.getHours()) + ':' + pad(d.getMinutes()) };
 }
 
+/** The date the add form should hold for month k: today in the current
+    month, otherwise the date already picked in k, otherwise today's day
+    number moved into k (the 31st becomes the 30th in a short month). */
+function dateInMonth(k) {
+  var n = nowLocal();
+  if (k === ym(new Date())) return n.d;
+  var cur = $('#dt').value;
+  if (cur && cur.slice(0, 7) === k) return cur;
+  return k + '-' + pad(Math.min(new Date().getDate(), daysIn(k)));
+}
+
 function resetForm() {
   var n = nowLocal();
   $('#amt').value = ''; $('#rem').value = '';
-  $('#dt').value = n.d; $('#tm').value = n.t;
+  $('#dt').value = dateInMonth(viewMonth); $('#tm').value = n.t;
   draft.shot = '';
   $('#shotPrev').classList.add('hide'); $('#shotClear').classList.add('hide');
   $('#shotBtn').textContent = 'Attach receipt';
@@ -1147,7 +1173,7 @@ function stopRule(id) {
                      'no new ones will be added.')) return;
   recur = recur.filter(function (x) { return x.id !== id; });
   save(K.recur, recur);
-  renderSettings();
+  renderRecur();
 }
 
 function shrink(file, maxPx, quality) {
@@ -1297,17 +1323,22 @@ var selDay = '';                  // 'YYYY-MM-DD' picked on the calendar, or ''
 
 function inMonth(k) { return txns.filter(function (t) { return ym(t.ts) === k; }); }
 
+/* One month switcher, in the top bar, for Add, Stats, History and Budget.
+   Away from the current month the label turns blue and reads as a button
+   back to today, so a back-dated month is never mistaken for this one. */
 function renderMonthNav() {
-  var label = monthName(ymDate(viewMonth));
-  $$('.monthnav b').forEach(function (b) { b.textContent = label; });
-  $$('.monthnav .today').forEach(function (b) {
-    b.classList.toggle('hide', viewMonth === ym(new Date()));
-  });
+  var isNow = viewMonth === ym(new Date());
+  var lbl = $('#hMonthLbl');
+  lbl.textContent = ymDate(viewMonth).toLocaleDateString('en-IN', { month:'short', year:'numeric' });
+  lbl.classList.toggle('off', !isNow);
+  lbl.title = isNow ? 'This month' : 'Back to this month';
 }
 
 function stepMonth(n) {
   viewMonth = n === 0 ? ym(new Date()) : ymShift(viewMonth, n);
   selDay = '';
+  $('#dt').value = dateInMonth(viewMonth);   // a back-dated entry starts here
+  freqHint();
   renderAll();
 }
 
@@ -1434,9 +1465,16 @@ function txHtml(t) {
 }
 
 function renderRecent() {
-  var r = txns.slice(0,6);
+  var isNow = viewMonth === ym(new Date());
+  var mName = monthName(ymDate(viewMonth)).split(' ')[0];
+  var r = inMonth(viewMonth).slice(0, 6);
+  $('#recentTitle').textContent = isNow ? 'Recent' : 'Recent in ' + mName;
+  $('#backNote').classList.toggle('hide', isNow);
+  $('#backNote').innerHTML = '<div>Adding to <b>' + esc(monthName(ymDate(viewMonth))) + '</b>. ' +
+    '<button class="link inline" type="button" data-step="0">Back to this month</button></div>';
   $('#recentList').innerHTML = r.length ? r.map(txHtml).join('')
-    : '<div class="empty">Nothing logged yet. Your first entry goes above.</div>';
+    : '<div class="empty">' + (isNow ? 'Nothing logged yet. Your first entry goes above.'
+                                     : 'Nothing logged in ' + esc(mName) + ' yet.') + '</div>';
 }
 
 var filter = { type:'', cat:'' };
@@ -1555,15 +1593,24 @@ function openTx(id) {
   };
 }
 
-// ============================ settings ============================
-function renderSettings() {
+// ============================ budget ============================
+function renderBudget() {
+  var spent = byCategory(inMonth(viewMonth), 'Expense'), total = 0;
+  Object.keys(spent).forEach(function (c) { total += spent[c]; });
+  var mName = monthName(ymDate(viewMonth)).split(' ')[0];
   $('#bTotal').value = bud.TOTAL || '';
+  $('#bTotalSpent').textContent = money(total) + ' spent in ' + mName;
   $('#bCats').innerHTML = CATS.Expense.map(function (c) {
-    return '<label class="f"><span>' + esc(c) + '</span>' +
+    var s = spent[c] || 0, lim = bud[c] || 0;
+    var cls = lim && s >= lim ? 'crit' : (lim && s >= lim * 0.8 ? 'warn' : '');
+    return '<label class="f"><span>' + esc(c) +
+      '<em class="' + cls + '">' + money(s) + (lim ? ' of ' + money(lim) : ' spent') + '</em></span>' +
       '<input class="in bcat" data-c="' + esc(c) + '" type="number" inputmode="numeric" ' +
-      'placeholder="no limit" value="' + (bud[c] || '') + '"></label>';
+      'placeholder="no limit" value="' + (lim || '') + '"></label>';
   }).join('');
+}
 
+function renderRecur() {
   $('#recList').innerHTML = recur.length ? recur.map(function (r) {
     return '<div class="tx"><div class="ic Savings">↻</div>' +
       '<div class="mid"><div class="t1">' + esc(r.remarks || r.category) + '</div>' +
@@ -1573,17 +1620,43 @@ function renderSettings() {
       '" style="width:auto;padding:7px 12px">Stop</button></div>';
   }).join('') : '<div class="empty" style="padding:14px 0">No monthly savings yet. Add a saving and ' +
                 'choose “Every month” — an SIP or RD, say.</div>';
+}
 
-  $('#acct').textContent = acct
-    ? (acct.email || 'Signed in') + ' · ' + (acct.mode === 'google' ? 'Google' : 'Email') +
-      (acct.gEmail && acct.gEmail !== acct.email ? ' · Drive: ' + acct.gEmail : '') +
-      ' · ' + txns.length + ' entries · app ' + APP_VERSION
-    : '';
-  $('#pinBtn').textContent = acct && acct.pinHash ? 'Change PIN' : 'Set a PIN';
-  var link = acct && acct.sheetId
-    ? 'https://docs.google.com/spreadsheets/d/' + acct.sheetId : '#';
+// ============================ settings ============================
+function renderSettings() {
+  if (!acct) return;
+  var mins = Math.max(0, Math.round((gExpiry - Date.now()) / 60000));
+  var n = pending();
+  var rows = [
+    ['Name', '<input class="in" id="acName" type="text" autocomplete="name" placeholder="Add your name" value="' +
+             esc(acct.name || '') + '">'],
+    ['Email', esc(acct.email || '—')],
+    ['Signed in with', acct.mode === 'google' ? 'Google' : 'Email and password'],
+    ['Google account', esc(acct.gEmail || acct.email || '—') +
+       '<small>Your sheet lives in this account\'s Drive</small>'],
+    ['Google connection', haveToken()
+       ? 'Connected<small>Renews in ' + mins + ' min — one tap when it does</small>'
+       : 'Needs a tap<small><button class="link inline" id="acReconnect" type="button" ' +
+         'style="margin:0">Reconnect now</button></small>'],
+    ['PIN lock', acct.pinHash ? 'On<small>Asked each time you open the app</small>' : 'Off'],
+    ['Entries', txns.length + (n ? '<small>' + n + ' waiting to sync</small>' : '<small>All synced</small>')],
+    ['App version', APP_VERSION]
+  ];
+  $('#acct').innerHTML = rows.map(function (r) {
+    return '<div class="kv"><dt>' + r[0] + '</dt><dd>' + r[1] + '</dd></div>';
+  }).join('');
+  $('#pinBtn').textContent = acct.pinHash ? 'Change PIN' : 'Set a PIN';
+  $('#pinOff').classList.toggle('hide', !acct.pinHash);
+  var link = acct.sheetId ? 'https://docs.google.com/spreadsheets/d/' + acct.sheetId : '#';
   $('#openSheet').href = link;
-  $('#openSheet').style.display = (acct && acct.sheetId) ? 'block' : 'none';
+  $('#openSheet').style.display = acct.sheetId ? 'block' : 'none';
+}
+
+function saveName() {
+  var v = String($('#acName').value || '').trim().slice(0, 60);
+  if (v === (acct.name || '')) return;
+  acct.name = v; save(K.acct, acct);
+  toast(v ? 'Name saved' : 'Name removed');
 }
 
 function saveBudgets() {
@@ -1596,6 +1669,7 @@ function saveBudgets() {
   save(K.bud, bud);
   toast('Budgets saved');
   renderStats();
+  renderBudget();
 }
 
 function exportCsv() {
@@ -1617,11 +1691,12 @@ function exportCsv() {
 
 // ============================ views ============================
 var view = 'add';
-var TITLES = { add:'Add entry', stats:'Stats', hist:'History', set:'Settings' };
+var TITLES = { add:'Add entry', stats:'Stats', hist:'History', bud:'Budget', set:'Settings' };
 
 function go(v) {
   view = v;
-  ['add','stats','hist','set'].forEach(function (k) {
+  $('#hMonth').classList.toggle('hide', v === 'set');
+  ['add','stats','hist','bud','set'].forEach(function (k) {
     $('#v-' + k).classList.toggle('hide', k !== v);
   });
   $$('nav.tabs button').forEach(function (b) {
@@ -1634,7 +1709,9 @@ function go(v) {
 
 function renderAll() {
   setPill();
+  if (view !== 'set')   renderMonthNav();
   if (view === 'add')   renderRecent();
+  if (view === 'bud')   { renderBudget(); renderRecur(); }
   if (view === 'stats') renderStats();
   if (view === 'hist')  { buildFilters(); renderHist(); }
   if (view === 'set')   renderSettings();
@@ -1684,7 +1761,8 @@ function init() {
 
   wirePin('#setPinBox', savePin);
   wirePin('#lockBox', checkPin);
-  $('#skipPin').addEventListener('click', function () { acct.pinHash = ''; save(K.acct, acct); openApp(); });
+  $('#skipPin').addEventListener('click', function () { acct.pinHash = ''; save(K.acct, acct); openApp();
+    if (pinFromSettings) { pinFromSettings = false; go('set'); } });
   $('#lockOut').addEventListener('click', logout);
 
   // --- app ---
@@ -1699,7 +1777,12 @@ function init() {
     draft.freq = b.dataset.v;
     buildChips();
   });
-  $('#dt').addEventListener('change', freqHint);
+  $('#dt').addEventListener('change', function () {
+    freqHint();
+    // Typing a date in another month moves the whole view there with it.
+    var k = String($('#dt').value).slice(0, 7);
+    if (/^\d{4}-\d{2}$/.test(k) && k !== viewMonth) { viewMonth = k; selDay = ''; renderAll(); }
+  });
 
   $('#save').addEventListener('click', saveEntry);
   $('#scanBtn').addEventListener('click', function () { $('#scanIn').click(); });
@@ -1723,8 +1806,9 @@ function init() {
 
   $('#q').addEventListener('input', renderHist);
   document.addEventListener('click', function (e) {
-    var m = e.target.closest('.monthnav button');
+    var m = e.target.closest('.monthnav button, #backNote button');
     if (m) { stepMonth(+m.dataset.step); return; }
+    if (e.target.closest('#acReconnect')) { sync(true).then(renderSettings); return; }
     var c = e.target.closest('#trend .col');
     if (c) { viewMonth = c.dataset.m; selDay = ''; renderAll(); return; }
     var d = e.target.closest('#cal .day');
@@ -1752,6 +1836,11 @@ function init() {
   $('#syncPill').addEventListener('click', function () { if (!syncing) sync(true); });
   $('#exportCsv').addEventListener('click', exportCsv);
   $('#pinBtn').addEventListener('click', changePin);
+  $('#pinOff').addEventListener('click', function () {
+    if (!confirm('Turn the PIN off? Anyone holding your phone can then open Paisa.')) return;
+    acct.pinHash = ''; save(K.acct, acct); renderSettings(); toast('PIN turned off');
+  });
+  document.addEventListener('change', function (e) { if (e.target.id === 'acName') saveName(); });
   $('#resetAll').addEventListener('click', resetAll);
   $('#logout').addEventListener('click', logout);
 
@@ -1766,7 +1855,7 @@ function init() {
   // --- where do we land? ---
   if (!acct)                 step('welcome');
   else if (!acct.sheetId)    step('drive');
-  else if (acct.pinHash)     { step('lock'); $('#lockWho').textContent = acct.email || ''; }
+  else if (acct.pinHash && !isUnlocked()) { step('lock'); $('#lockWho').textContent = acct.name || acct.email || ''; }
   else                       openApp();
 
   if ('serviceWorker' in navigator) {
