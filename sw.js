@@ -1,8 +1,8 @@
 /* Offline shell. The app's data lives in localStorage, not here —
    this only makes sure the app itself opens with no internet. */
-var CACHE = 'paisa-v8';
+var CACHE = 'paisa-v9';
 var KEEP = [CACHE, 'paisa-share'];
-var SHELL = ['./', 'index.html', 'app.js?v=8', 'manifest.webmanifest',
+var SHELL = ['./', 'index.html', 'app.js?v=9', 'manifest.webmanifest',
              'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', function (e) {
@@ -57,8 +57,13 @@ self.addEventListener('fetch', function (e) {
 
   var url = u;
 
-  // Never cache the Apps Script API — always go to the network.
-  if (url.hostname.indexOf('google.com') > -1) return;
+  /* Only ever touch OUR OWN files.
+     Everything cross-origin — Google's APIs, the sign-in library, Apps Script —
+     must pass straight through untouched. Below we rebuild the request from its
+     URL to force revalidation, and rebuilding drops its headers; doing that to
+     an API call strips the Authorization header and Google rejects it as an
+     "unregistered caller". Same-origin only, no exceptions. */
+  if (url.origin !== location.origin) return;
   if (e.request.method !== 'GET') return;
 
   // Shell files: network first (so updates land), cache as fallback.
