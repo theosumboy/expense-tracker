@@ -223,6 +223,12 @@ header.top h1{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellip
 .kv dd{margin:0;color:var(--ink);word-break:break-word;font-weight:550}
 .kv dd small{display:block;color:var(--muted);font-size:11.5px;font-weight:500;margin-top:1px}
 .kv .in{padding:8px 11px}
+.sheetlede{color:var(--ink-2);font-size:13.5px;margin:0 0 14px}
+ol.steps{margin:0 0 6px;padding:0;list-style:none;counter-reset:st}
+ol.steps li{counter-increment:st;position:relative;padding:0 0 16px 34px;font-size:14px}
+ol.steps li:before{content:counter(st);position:absolute;left:0;top:0;width:24px;height:24px;border-radius:50%;
+  background:var(--brand-soft);color:var(--brand);font-weight:700;font-size:12.5px;display:grid;place-items:center}
+ol.steps li span{display:block;color:var(--muted);font-size:12.5px;margin:2px 0 9px}
 .cal{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
 .cal .wd{font-size:10.5px;font-weight:650;color:var(--muted);text-align:center;padding-bottom:2px}
 .cal .day{min-height:50px;border-radius:9px;background:var(--surface-2);border:1px solid transparent;
@@ -571,6 +577,7 @@ header.top h1{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellip
     <div class="card">
       <h2>Account</h2>
       <dl class="kvs" id="acct"></dl>
+      <button class="btn ghost sm" id="switchAcct" style="margin-top:12px">Switch Google account</button>
     </div>
 
     <div class="card">
@@ -606,6 +613,6 @@ header.top h1{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellip
 </nav>
 </div>
 
-<script src="app.js?v=11"></script>
+<script src="app.js?v=12"></script>
 </body>
 </html>
