@@ -10,7 +10,7 @@
 (function () {
 'use strict';
 
-var APP_VERSION = 'v11';
+var APP_VERSION = 'v12';
 
 /* Your Google OAuth client. Safe to be public — it identifies the app, it
    grants nothing on its own. */
@@ -164,7 +164,7 @@ function gisReady() {
   return !!(window.google && window.google.accounts && window.google.accounts.oauth2);
 }
 
-function askGoogle() {
+function askGoogle(pick) {
   return new Promise(function (resolve, reject) {
     if (!tokenClient) {
       tokenClient = google.accounts.oauth2.initTokenClient({
@@ -189,8 +189,9 @@ function askGoogle() {
     // prompt '' = show consent only if it was never given. login_hint names
     // the account, so Google skips the account chooser and the popup closes
     // by itself. ('consent' here forced the full screen on every renewal.)
-    var opts = { prompt: '' };
-    if (acct && acct.gEmail) opts.login_hint = acct.gEmail;
+    // pick = switching accounts: show the chooser and suggest nobody.
+    var opts = { prompt: pick ? 'select_account' : '' };
+    if (!pick && acct && acct.gEmail) opts.login_hint = acct.gEmail;
     try {
       tokenClient.requestAccessToken(opts);
     } catch (e) { reject(e); }
@@ -785,13 +786,51 @@ function doEmail() {
   });
 }
 
+/**
+ * Who the connected Google account is. Drive's "about" works with the
+ * narrow drive.file scope and also gives the display name; userinfo is the
+ * fallback. Resolves {email, name}, empty strings when unknown.
+ */
+function whoAmI() {
+  return gfetch(DRIVE.replace('/files', '/about') + '?fields=user(displayName,emailAddress)')
+    .then(function (r) {
+      var u = (r && r.user) || {};
+      if (u.emailAddress) return { email: u.emailAddress, name: u.displayName || '' };
+      throw new Error('no user');
+    })
+    .catch(function (e) {
+      if (isNeedTap(e)) throw e;
+      return gfetch('https://www.googleapis.com/oauth2/v3/userinfo').then(function (i) {
+        return { email: (i && i.email) || '', name: (i && i.name) || '' };
+      });
+    })
+    .catch(function (e) { if (isNeedTap(e)) throw e; return { email: '', name: '' }; });
+}
+
+/* Accounts made while the v8 service-worker bug was live never got their
+   email: the lookup failed silently and nothing retried it. This fills any
+   gap the next time a token is in hand. It never overwrites a name the user
+   typed. */
+function fillIdentity() {
+  if (!acct || !haveToken()) return Promise.resolve();
+  var gap = !acct.gEmail || !acct.name || (acct.mode === 'google' && !acct.email);
+  if (!gap) return Promise.resolve();
+  return whoAmI().then(function (me) {
+    if (!me.email) return;
+    acct.gEmail = me.email;
+    if (acct.mode === 'google') acct.email = me.email;
+    if (!acct.name && me.name) acct.name = me.name;
+    save(K.acct, acct);
+  }).catch(function(){});
+}
+
 function doGoogle() {
   busy(true, 'Opening Google…');
   token(true).then(function () {
-    return gfetch('https://www.googleapis.com/oauth2/v3/userinfo').catch(function(){ return {}; });
-  }).then(function (info) {
-    var em = (info && info.email) || '';
-    acct = { mode:'google', email: em, gEmail: em, sheetId:'', gid:null, pinHash:'' };
+    return whoAmI();
+  }).then(function (me) {
+    acct = { mode:'google', email: me.email, gEmail: me.email, name: me.name,
+             sheetId:'', gid:null, pinHash:'' };
     save(K.acct, acct);
     return connectDrive();
   }).catch(function (e) {
@@ -815,10 +854,7 @@ function connectDrive() {
       // Which Google account holds the sheet. Used as the login hint later,
       // so renewing the token never shows the account chooser. Email users
       // may pick a Google account different from their Paisa email.
-      if (acct.gEmail) return;
-      return gfetch('https://www.googleapis.com/oauth2/v3/userinfo').then(function (info) {
-        if (info && info.email) { acct.gEmail = info.email; save(K.acct, acct); }
-      }).catch(function(){});
+      return fillIdentity();
     })
     .then(function () { return ensureSheet(); })
     .then(function () { return pullAll(); })
@@ -919,6 +955,98 @@ function resetAll() {
   } else done();
 }
 
+// ============================ switch Google account ============================
+/* drive.file means a new account can never see the old sheet, so switching
+   COPIES: the phone already holds every entry; refresh from the old sheet
+   first, then write them all into a Paisa sheet in the new account's Drive.
+   The old sheet is left exactly where it was. Two taps, because each Google
+   popup needs a click of its own. Rows keep their ids, so if the new account
+   already has a Paisa sheet the two merge with no duplicates. */
+function openSwitch() {
+  var w = document.createElement('div');
+  w.className = 'sheet';
+  w.innerHTML = '<div><h3>Switch Google account</h3>' +
+    '<p class="sheetlede">Your ' + txns.length + ' entries are copied into a Paisa sheet in the new ' +
+    'account\'s Drive. Nothing is deleted \u2014 the sheet in <b>' + esc(acct.gEmail || acct.email || 'this account') +
+    '</b> stays as it is.</p>' +
+    '<ol class="steps">' +
+    '<li><b>Get the latest from this account</b><span id="swFreshNote">So entries added on another phone come too.</span>' +
+    '<button class="btn ghost sm" id="swFresh" type="button">Refresh now</button></li>' +
+    '<li><b>Choose the new account</b><span>Budgets, monthly savings and your PIN stay on this phone.</span>' +
+    '<button class="btn sm" id="swGo" type="button">Choose Google account</button></li></ol>' +
+    '<div class="busyline hide" id="swBusy"><span class="spin"></span><span id="swMsg">Working\u2026</span></div>' +
+    '<div class="err" id="swErr"></div>' +
+    '<button class="btn ghost sm" id="swNo" type="button">Cancel</button></div>';
+  document.body.appendChild(w);
+  var $w = function (s) { return w.querySelector(s); };
+  var close = function () { w.remove(); renderAll(); };
+  $w('#swNo').onclick = close;
+  w.onclick = function (e) { if (e.target === w) close(); };
+
+  $w('#swFresh').onclick = function () {
+    $w('#swFresh').disabled = true;
+    sync(true).then(function () {
+      $w('#swFreshNote').textContent = pending()
+        ? 'Could not reach the sheet. The copy will use what is on this phone.'
+        : 'Up to date \u2014 ' + txns.length + ' entries.';
+      $w('#swFresh').disabled = false;
+    });
+  };
+
+  $w('#swGo').onclick = function () {
+    var before = { acct: JSON.stringify(acct), txns: JSON.stringify(txns),
+                   tok: { t: gToken, exp: gExpiry } };
+    var oldEmail = acct.gEmail || acct.email || '';
+    var restore = function () {
+      acct = JSON.parse(before.acct); save(K.acct, acct);
+      txns = JSON.parse(before.txns); save(K.txns, txns);
+      gToken = before.tok.t; gExpiry = before.tok.exp;
+      if (gToken) save(K.tok, { t: gToken, exp: gExpiry }); else dropToken();
+    };
+    var say = function (m) { $w('#swBusy').classList.remove('hide'); $w('#swMsg').textContent = m; };
+    $w('#swErr').textContent = '';
+    $w('#swGo').disabled = true;
+
+    dropToken();                      // or token() would hand back the old account
+    (gisReady() ? askGoogle(true) : loadGis().then(function () { return askGoogle(true); }))
+      .then(function () { say('Checking the account\u2026'); return whoAmI(); })
+      .then(function (me) {
+        if (!me.email) throw new Error('Could not tell which account you picked. Try again.');
+        if (oldEmail && me.email.toLowerCase() === oldEmail.toLowerCase())
+          throw new Error('That is the account you are already using. Pick a different one.');
+        say('Copying ' + txns.length + ' entries to ' + me.email + '\u2026');
+        acct.prevSheets = (acct.prevSheets || []).concat([{ email: oldEmail, sheetId: acct.sheetId }]);
+        acct.gEmail = me.email;
+        if (acct.mode === 'google') { acct.email = me.email; if (me.name) acct.name = me.name; }
+        acct.sheetId = ''; acct.gid = null;
+        save(K.acct, acct);
+        txns.forEach(function (t) { t._s = 0; delete t._row; });
+        save(K.txns, txns);
+        return ensureSheet()
+          .then(function () { return pullAll(); })      // merge with any sheet already there
+          .then(function () { return pushRows(txns.filter(function (t) { return !t._s; })); })
+          .then(function () { return pullAll(); })
+          .then(function () { return me; });
+      })
+      .then(function (me) {
+        w.remove();
+        toast('Now using ' + me.email + ' \u2014 ' + txns.length + ' entries copied');
+        renderAll();
+      })
+      .catch(function (e) {
+        // Put everything back exactly as it was, sync flags included:
+        // re-pushing the old account's rows as unsynced would duplicate them.
+        restore();
+        $w('#swBusy').classList.add('hide');
+        $w('#swGo').disabled = false;
+        var m = String((e && e.message) || '');
+        $w('#swErr').textContent = /Google API/.test(m)
+          ? 'Could not write to the new account\'s Drive. Nothing changed; try again.'
+          : (/^(Could not tell|That is the account)/.test(m) ? m : authReason(e));
+      });
+  };
+}
+
 var pinFromSettings = false;    // return to Settings, not Add, afterwards
 
 function changePin() {
@@ -963,6 +1091,7 @@ function sync(interactive) {
     })
     .then(function () { return pushShots(); })
     .then(function () { return pullAll(); })
+    .then(function () { return fillIdentity(); })
     .catch(function (e) {
       if (!interactive) return;               // background: the pill says enough
       toast(/Google API/.test(e.message)
@@ -1625,15 +1754,21 @@ function renderRecur() {
 // ============================ settings ============================
 function renderSettings() {
   if (!acct) return;
+  // For Google sign-in the login IS the Drive account: one email. Only an
+  // email-and-password user whose sheet sits in a different Google account
+  // needs a second line.
+  var email = acct.mode === 'google' ? (acct.gEmail || acct.email) : acct.email;
   var mins = Math.max(0, Math.round((gExpiry - Date.now()) / 60000));
   var n = pending();
   var rows = [
     ['Name', '<input class="in" id="acName" type="text" autocomplete="name" placeholder="Add your name" value="' +
              esc(acct.name || '') + '">'],
-    ['Email', esc(acct.email || '—')],
-    ['Signed in with', acct.mode === 'google' ? 'Google' : 'Email and password'],
-    ['Google account', esc(acct.gEmail || acct.email || '—') +
-       '<small>Your sheet lives in this account\'s Drive</small>'],
+    ['Email', email ? esc(email) + '<small>' + (acct.mode === 'google'
+         ? 'Signed in with Google \u00b7 your sheet is in this Drive'
+         : 'Signed in with email and password') + '</small>'
+       : 'Not known yet<small>Fills in by itself on the next sync</small>']
+  ].concat(acct.mode !== 'google' && acct.gEmail && acct.gEmail !== acct.email
+    ? [['Sheet in Drive of', esc(acct.gEmail)]] : []).concat([
     ['Google connection', haveToken()
        ? 'Connected<small>Renews in ' + mins + ' min — one tap when it does</small>'
        : 'Needs a tap<small><button class="link inline" id="acReconnect" type="button" ' +
@@ -1641,7 +1776,7 @@ function renderSettings() {
     ['PIN lock', acct.pinHash ? 'On<small>Asked each time you open the app</small>' : 'Off'],
     ['Entries', txns.length + (n ? '<small>' + n + ' waiting to sync</small>' : '<small>All synced</small>')],
     ['App version', APP_VERSION]
-  ];
+  ]);
   $('#acct').innerHTML = rows.map(function (r) {
     return '<div class="kv"><dt>' + r[0] + '</dt><dd>' + r[1] + '</dd></div>';
   }).join('');
@@ -1836,6 +1971,7 @@ function init() {
   $('#syncPill').addEventListener('click', function () { if (!syncing) sync(true); });
   $('#exportCsv').addEventListener('click', exportCsv);
   $('#pinBtn').addEventListener('click', changePin);
+  $('#switchAcct').addEventListener('click', openSwitch);
   $('#pinOff').addEventListener('click', function () {
     if (!confirm('Turn the PIN off? Anyone holding your phone can then open Paisa.')) return;
     acct.pinHash = ''; save(K.acct, acct); renderSettings(); toast('PIN turned off');
