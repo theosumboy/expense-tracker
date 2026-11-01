@@ -223,6 +223,31 @@ header.top h1{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellip
 .kv dd{margin:0;color:var(--ink);word-break:break-word;font-weight:550}
 .kv dd small{display:block;color:var(--muted);font-size:11.5px;font-weight:500;margin-top:1px}
 .kv .in{padding:8px 11px}
+.btotal{background:var(--surface-2);border-radius:14px;padding:14px;margin-bottom:16px}
+.btotal>span{display:block;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.btotal>b{display:block;font-size:28px;margin-top:2px}
+.btotal small{display:block;color:var(--ink-2);font-size:13px}
+.btotal small b{font-weight:700}
+b.ok,.brow.ok .bst{color:var(--income)} b.warn,.brow.warn .bst{color:var(--warn)} b.crit,.brow.crit .bst{color:var(--crit)}
+.brow.none .bst{color:var(--muted)}
+.chipx{display:inline-flex;align-items:center}
+.chipx .chip{border-top-right-radius:0;border-bottom-right-radius:0;border-right:0}
+.chipx .x{border:1px solid var(--line);background:var(--surface-2);color:var(--muted);font-size:15px;line-height:1;
+  padding:0 10px;align-self:stretch;border-radius:0 999px 999px 0;cursor:pointer}
+.chipx .chip[aria-pressed="true"]+.x{border-color:var(--brand)}
+.chip.add{border-style:dashed;color:var(--brand)}
+.bnew{display:flex;gap:8px;margin:-4px 0 14px}
+.bnew .btn{width:auto;padding:10px 16px}
+.brow{padding:12px 0;border-top:1px solid var(--line)}
+.brow:first-child{border-top:0;padding-top:2px}
+.bhead,.bfoot{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.bhead b{font-size:14.5px}
+.bst{font-size:13px;font-weight:700;text-align:right}
+.brow .meter{margin:8px 0 6px}
+.bfoot{font-size:12.5px;color:var(--muted)}
+.bedit{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.bedit .in{flex:1 1 140px}
+.bedit .btn{width:auto;padding:10px 14px}
 .sheetlede{color:var(--ink-2);font-size:13.5px;margin:0 0 14px}
 ol.steps{margin:0 0 6px;padding:0;list-style:none;counter-reset:st}
 ol.steps li{counter-increment:st;position:relative;padding:0 0 16px 34px;font-size:14px}
@@ -559,10 +584,26 @@ ol.steps li span{display:block;color:var(--muted);font-size:12.5px;margin:2px 0 
   <section id="v-bud" class="hide">
     <div class="card">
       <h2>Monthly budget</h2>
-      <label class="f"><span>Overall limit (₹)<em id="bTotalSpent"></em></span>
-        <input class="in" id="bTotal" type="number" inputmode="numeric" placeholder="e.g. 25000"></label>
-      <div id="bCats"></div>
-      <button class="btn sm" id="bSave">Save budgets</button>
+      <div class="btotal">
+        <span>Total monthly budget</span>
+        <b id="bTotalV">₹0</b>
+        <div class="meter"><i id="bTotalMeter"></i></div>
+        <small id="bTotalSub"></small>
+      </div>
+      <label class="f"><span>Amount (₹)</span>
+        <input class="in" id="bAmt" type="number" inputmode="numeric" placeholder="e.g. 5000"></label>
+      <div class="f"><span>Category</span>
+        <div class="chips" id="bCatChips"></div></div>
+      <div class="bnew hide" id="bNewRow">
+        <input class="in" id="bNewName" maxlength="30" placeholder="New category, e.g. Health">
+        <button class="btn sm" id="bNewAdd" type="button">Add</button>
+      </div>
+      <button class="btn sm" id="bSet" type="button">Set budget</button>
+    </div>
+
+    <div class="card">
+      <h2>Budgets this month</h2>
+      <div id="bList"></div>
     </div>
 
     <div class="card">
@@ -613,6 +654,6 @@ ol.steps li span{display:block;color:var(--muted);font-size:12.5px;margin:2px 0 
 </nav>
 </div>
 
-<script src="app.js?v=12"></script>
+<script src="app.js?v=15"></script>
 </body>
 </html>
