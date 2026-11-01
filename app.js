@@ -10,7 +10,7 @@
 (function () {
 'use strict';
 
-var APP_VERSION = 'v16';
+var APP_VERSION = 'v17';
 
 /* Your Google OAuth client. Safe to be public — it identifies the app, it
    grants nothing on its own. */
@@ -63,7 +63,8 @@ var TYPES = ['Expense','Income','Savings'];
    p.rec and it must not be mistaken for a rule. p.tok is the Google access
    token, kept so that reopening the app within the hour needs no sign-in. */
 var K = { acct:'p.acct', txns:'p.txns', bud:'p.bud', recur:'p.recur', shots:'p.shots',
-          tok:'p.tok', cats:'p.cats', budDirty:'p.budDirty', iosHint:'p.iosHint' };
+          tok:'p.tok', cats:'p.cats', budDirty:'p.budDirty', iosHint:'p.iosHint',
+          alertsOff:'p.alertsOff' };
 
 function load(k, d) {
   try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; }
@@ -1710,17 +1711,23 @@ function renderStats() {
       (sav > 0 ? ' · saved ' + Math.round(sav / inc * 100) + '% of income' : '')
     : 'Add your income to see what is left over.';
 
+  /* Same rule as the Budget tab: red only once spending goes PAST a limit;
+     exactly at it is "used up", amber. Rent or an EMI paid in full is not
+     over budget. Each alert is shown until its × is tapped, and stays gone
+     for that month (p.alertsOff, which survives refresh and log-out). It
+     comes back only if it gets worse: used up → exceeded. */
   var limit = budTotal(), meter = $('#sMeter'), alerts = [];
   var byCat = byCategory(list, 'Expense');
+  var level = function (s, l) { return s > l ? 'crit' : (s >= l * 0.8 ? 'warn' : ''); };
   if (limit > 0) {
     var pct = exp / limit;
     meter.style.width = Math.min(100, pct*100) + '%';
-    meter.className = pct >= 1 ? 'crit' : (pct >= 0.8 ? 'warn' : '');
+    meter.className = level(exp, limit);
     $('#sLeft').textContent = money(Math.max(0, limit - exp));
-    if (pct >= 1) alerts.push(['crit','Over budget',
-      'You spent ' + money(exp) + ' of your ' + money(limit) + ' limit — ' +
-      money(exp - limit) + ' over.']);
-    else if (pct >= 0.8 && isNow) alerts.push(['warn', Math.round(pct*100) + '% of budget used',
+    var lt = level(exp, limit);
+    if (lt === 'crit') alerts.push(['crit', 'TOTAL', 'Over budget',
+      'You spent ' + money(exp) + ' of your ' + money(limit) + ' budget, ' + money(exp - limit) + ' over.']);
+    else if (lt && isNow) alerts.push(['warn', 'TOTAL', Math.round(pct*100) + '% of budget used',
       money(limit - exp) + ' left for the rest of ' + mName + '.']);
   } else {
     meter.style.width = '0'; meter.className = '';
@@ -1728,15 +1735,20 @@ function renderStats() {
   }
   Object.keys(bud).forEach(function (c) {
     if (!bud[c]) return;
-    var spent = byCat[c] || 0;
-    if (spent >= bud[c]) alerts.push(['crit', c + ' over limit',
-      money(spent) + ' spent against a ' + money(bud[c]) + ' limit.']);
-    else if (spent >= bud[c]*0.8 && isNow) alerts.push(['warn', c + ' nearly used up',
-      money(bud[c]-spent) + ' left of ' + money(bud[c]) + '.']);
+    var spent = byCat[c] || 0, lv = level(spent, bud[c]);
+    if (lv === 'crit') alerts.push(['crit', c, c + ' budget exceeded',
+      money(spent) + ' spent of ' + money(bud[c]) + ', ' + money(spent - bud[c]) + ' over.']);
+    else if (lv && isNow) alerts.push(['warn', c, spent >= bud[c] ? c + ' budget used up' : c + ' nearly used up',
+      spent >= bud[c] ? money(spent) + ' spent of ' + money(bud[c]) + '.'
+                      : money(bud[c] - spent) + ' left of ' + money(bud[c]) + '.']);
   });
+  var off = load(K.alertsOff, []);
+  alerts = alerts.map(function (a) { return a.concat([key + '|' + a[1] + '|' + a[0]]); })
+                 .filter(function (a) { return off.indexOf(a[4]) < 0; });
   $('#alerts').innerHTML = alerts.slice(0,3).map(function (a) {
     return '<div class="alert ' + a[0] + '"><span>' + (a[0]==='crit'?'⚠':'!') +
-           '</span><div><b>' + esc(a[1]) + '</b><br>' + esc(a[2]) + '</div></div>';
+           '</span><div><b>' + esc(a[2]) + '</b><br>' + esc(a[3]) + '</div>' +
+           '<button class="ax" type="button" data-k="' + esc(a[4]) + '" aria-label="Dismiss">\u00d7</button></div>';
   }).join('');
 
   // Pace: a running month projects forward; a finished one just averages.
@@ -2289,6 +2301,13 @@ function init() {
     var m = e.target.closest('.monthnav button, #backNote button');
     if (m) { stepMonth(+m.dataset.step); return; }
     if (e.target.closest('#acReconnect')) { sync(true).then(renderSettings); return; }
+    var ax = e.target.closest('#alerts .ax');
+    if (ax) {
+      var off = load(K.alertsOff, []);
+      off.push(ax.dataset.k);
+      save(K.alertsOff, off.slice(-200));
+      renderStats(); return;
+    }
     if (e.target.closest('#scanMove')) { moveScan(true); return; }
     if (e.target.closest('#scanKeep')) { moveScan(false); return; }
     if (e.target.closest('#txMove')) { moveTx(e.target.closest('#txMove').dataset.id); return; }
