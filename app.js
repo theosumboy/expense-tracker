@@ -10,7 +10,7 @@
 (function () {
 'use strict';
 
-var APP_VERSION = 'v15';
+var APP_VERSION = 'v16';
 
 /* Your Google OAuth client. Safe to be public — it identifies the app, it
    grants nothing on its own. */
@@ -63,7 +63,7 @@ var TYPES = ['Expense','Income','Savings'];
    p.rec and it must not be mistaken for a rule. p.tok is the Google access
    token, kept so that reopening the app within the hour needs no sign-in. */
 var K = { acct:'p.acct', txns:'p.txns', bud:'p.bud', recur:'p.recur', shots:'p.shots',
-          tok:'p.tok', cats:'p.cats', budDirty:'p.budDirty' };
+          tok:'p.tok', cats:'p.cats', budDirty:'p.budDirty', iosHint:'p.iosHint' };
 
 function load(k, d) {
   try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; }
@@ -2060,6 +2060,54 @@ function renderRecur() {
 }
 
 // ============================ settings ============================
+// ============================ iPhone install card (v16) ============================
+/* Safari never offers to install a web app the way Chrome on Android does;
+   the user has to find Share > Add to Home Screen. So iPhones running Paisa
+   in a browser tab get a card saying how. Once opened from the home screen
+   (navigator.standalone) the card never shows. iPadOS reports itself as a
+   Mac, hence the touch check. */
+function isIOS() {
+  var ua = navigator.userAgent || '';
+  return /iPhone|iPad|iPod/.test(ua) ||
+         (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+function isInstalled() {
+  return navigator.standalone === true ||
+         !!(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+}
+
+var SHARE_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7.5 7.5 12 3l4.5 4.5" ' +
+  'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' +
+  '<path d="M8 11H6a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1h-2" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+var ADD_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="4" ' +
+  'fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 8.5v7M8.5 12h7" stroke="currentColor" ' +
+  'stroke-width="2" stroke-linecap="round"/></svg>';
+
+function iosHintHtml(closable) {
+  return '<div class="ioshint">' +
+    (closable ? '<button class="x" type="button" id="iosHintX" aria-label="Hide">\u00d7</button>' : '') +
+    '<b>Install Paisa on your iPhone</b>' +
+    '<ol><li>Tap <span class="ic">' + SHARE_ICON + '</span> <b>Share</b> in Safari\u2019s toolbar</li>' +
+    '<li>Choose <span class="ic">' + ADD_ICON + '</span> <b>Add to Home Screen</b>, then <b>Add</b></li>' +
+    '<li>Open Paisa from its new icon' + (closable ? ' and sign in there' : '') + '</li></ol>' +
+    '<small>' + (closable
+      ? 'The home-screen app keeps its own login, so sign in after installing, not before.'
+      : 'It opens full-screen, and iPhone keeps its data even if Safari is not used for a while.') +
+    '</small></div>';
+}
+
+function showIosHint() {
+  if (!isIOS() || isInstalled()) return;
+  if (!load(K.iosHint, 0)) {
+    $('#iosHintW').innerHTML = iosHintHtml(true);
+    $('#iosHintW').classList.remove('hide');
+    $('#iosHintX').onclick = function () { save(K.iosHint, 1); $('#iosHintW').classList.add('hide'); };
+  }
+  $('#iosHintS').innerHTML = iosHintHtml(false);
+  $('#iosHintS').classList.remove('hide');
+}
+
 function renderSettings() {
   if (!acct) return;
   // For Google sign-in the login IS the Drive account: one email. Only an
@@ -2164,6 +2212,7 @@ function openApp() {
 
 // ============================ wiring ============================
 function init() {
+  showIosHint();
   // Load Google's library up front, so that when the user taps a button the
   // popup can open in the same instant as the tap. Loading it lazily on the
   // click costs us the popup — browsers only allow one during the click.
