@@ -10,7 +10,7 @@
 (function () {
 'use strict';
 
-var APP_VERSION = 'v12';
+var APP_VERSION = 'v15';
 
 /* Your Google OAuth client. Safe to be public — it identifies the app, it
    grants nothing on its own. */
@@ -30,9 +30,13 @@ var TXN_HEADERS = ['DATE','TIME','TYPE','CATEGORY','AMOUNT','MODE','REMARKS','SC
 
 /* Each type has its own vocabulary. They all land in the same CATEGORY and
    MODE columns of the sheet, so the sheet layout never changes. */
+/* Expense categories are the same list on Add and on Budget (v15): the
+   built-in ones below, then whatever the user added (p.cats), which follow
+   them to any phone through the sheet's Budgets tab. */
+var BASE_EXP = ['Food','Grocery','Fuel','Transportation','Shopping','Entertainment/OTT',
+                'Wifi','Rent','EMI','Others'];
 var CATS = {
-  Expense: ['Food','Grocery','Transportation','Shopping','Entertainment',
-            'Bills & Recharge','Health','Rent / EMI','Education','Other'],
+  Expense: BASE_EXP.slice(),
   Income:  ['Salary','Business','Freelance','Interest','Dividend','Rental',
             'Gift','Refund','Other'],
   Savings: ['Mutual fund / SIP','Fixed deposit','Recurring deposit','PPF','NPS',
@@ -59,7 +63,7 @@ var TYPES = ['Expense','Income','Savings'];
    p.rec and it must not be mistaken for a rule. p.tok is the Google access
    token, kept so that reopening the app within the hour needs no sign-in. */
 var K = { acct:'p.acct', txns:'p.txns', bud:'p.bud', recur:'p.recur', shots:'p.shots',
-          tok:'p.tok' };
+          tok:'p.tok', cats:'p.cats', budDirty:'p.budDirty' };
 
 function load(k, d) {
   try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; }
@@ -72,7 +76,10 @@ function save(k, v) {
 
 var acct  = load(K.acct, null);   // {mode:'google'|'email', email, sheetId, gid, pinHash}
 var txns  = load(K.txns, []);
-var bud   = load(K.bud, {});
+var bud   = load(K.bud, {});      // {category: monthly limit}. 'TOTAL' was pre-v15; the total is now the sum
+var myCats = load(K.cats, []);    // expense categories the user added
+delete bud.TOTAL;
+CATS.Expense = BASE_EXP.concat(myCats);
 var recur = load(K.recur, []);    // [{id, category, amount, mode, remarks, day, time, last:'YYYY-MM'}]
 var shots = load(K.shots, {});
 
@@ -164,8 +171,14 @@ function gisReady() {
   return !!(window.google && window.google.accounts && window.google.accounts.oauth2);
 }
 
+// One request at a time. An early renewal and the Save it was tapped for can
+// both ask in the same click; they share the popup instead of the second one
+// replacing the first one's callback.
+var asking = null;
+
 function askGoogle(pick) {
-  return new Promise(function (resolve, reject) {
+  if (asking && !pick) return asking;
+  var p = new Promise(function (resolve, reject) {
     if (!tokenClient) {
       tokenClient = google.accounts.oauth2.initTokenClient({
         client_id: CLIENT_ID,
@@ -196,6 +209,33 @@ function askGoogle(pick) {
       tokenClient.requestAccessToken(opts);
     } catch (e) { reject(e); }
   });
+  asking = p;
+  var done = function () { if (asking === p) asking = null; };
+  p.then(done, done);
+  return p;
+}
+
+/* Early renewal (v13). The token lasts an hour and can only be renewed in a
+   click, so renew it on whatever the user taps next once it is under ten
+   minutes from running out: switching to Income, opening History, anything.
+   Then the tap that matters (Scan, Save) finds a token already there and the
+   receipt reads straight away instead of asking for another tap. With
+   login_hint and prompt '' the window closes by itself.
+   Not on the lock screen or during sign-up (#app hidden), not inside a
+   dialog (Switch account asks for the chooser itself), and not on Scan,
+   whose click has to open the file picker. */
+var lastRenewTry = 0;
+
+function tokenSoon() { return !gToken || Date.now() > gExpiry - 10 * 60000; }
+
+function renewOnTap(e) {
+  if (!acct || !acct.sheetId || !navigator.onLine || !gisReady()) return;
+  if (!tokenSoon() || asking) return;
+  if ($('#app').classList.contains('hide')) return;
+  if (e.target.closest('.sheet, #scanBtn, #scanIn, #shotBtn, #shotIn, input, select, textarea')) return;
+  if (Date.now() - lastRenewTry < 5 * 60000) return;   // closed it? don't nag
+  lastRenewTry = Date.now();
+  askGoogle().then(function () { setPill(); sync(false); }, function () { setPill(); });
 }
 
 /**
@@ -380,6 +420,93 @@ function deleteRow(t) {
                  startIndex: t._row - 1, endIndex: t._row } } }] })
     });
   });
+}
+
+/** Rewrites one entry's row after its date changed. Looks the row up by id
+    first: a row number from the last pull may have shifted if the sheet was
+    edited since, and writing to the wrong row would overwrite another entry. */
+function updateRow(t) {
+  return pullRows().then(function (remote) {
+    var hit = remote.filter(function (r) { return r.id === t.id; })[0];
+    if (!hit) { t._s = 0; return; }           // not in the sheet after all: append it
+    t._row = hit._row;
+    return ensureSheet().then(function (id) {
+      var a1 = 'Transactions!A' + hit._row + ':I' + hit._row;
+      return gfetch(SHEETS + '/' + id + '/values/' + encodeURIComponent(a1) + '?valueInputOption=USER_ENTERED', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ range: a1, values: [rowOf(t)] })
+      });
+    });
+  });
+}
+
+/** Entries moved to another date while their old row is in the sheet.
+    _mv stays set until the row is rewritten, and pullAll keeps the local
+    date meanwhile, or the next pull would quietly move it back. */
+function pushMoves() {
+  var list = txns.filter(function (t) { return t._mv; });
+  var chain = Promise.resolve();
+  list.forEach(function (t) {
+    chain = chain.then(function () { return updateRow(t); })
+                 .then(function () { delete t._mv; save(K.txns, txns); });
+  });
+  return chain;
+}
+
+/* Budgets and added categories (v15) live in the sheet's Budgets tab, so
+   they last as long as the account and reach every phone:
+     CATEGORY | MONTHLY BUDGET | ADDED BY YOU
+   A change here sets p.budDirty and the tab is rewritten whole on the next
+   sync. Otherwise the tab wins. A tab with no header has never been written
+   (sheets made before v15), so this phone's budgets fill it. */
+var BUD_HEADERS = ['CATEGORY', 'MONTHLY BUDGET', 'ADDED BY YOU'];
+
+function budChanged() {
+  save(K.bud, bud); save(K.cats, myCats); save(K.budDirty, 1);
+  CATS.Expense = BASE_EXP.concat(myCats);
+}
+
+function pushBudgets(id) {
+  var names = myCats.slice();
+  Object.keys(bud).forEach(function (c) { if (names.indexOf(c) < 0) names.push(c); });
+  var vals = [BUD_HEADERS].concat(names.map(function (c) {
+    return [c, bud[c] || '', myCats.indexOf(c) > -1 ? 'yes' : ''];
+  }));
+  return gfetch(SHEETS + '/' + id + '/values/Budgets!A:C:clear', { method: 'POST' })
+    .then(function () {
+      return gfetch(SHEETS + '/' + id + '/values/Budgets!A1:C' + vals.length + '?valueInputOption=RAW', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ values: vals })
+      });
+    })
+    .then(function () { localStorage.removeItem(K.budDirty); });
+}
+
+function syncBudgets() {
+  return ensureSheet().then(function (id) {
+    if (load(K.budDirty, 0)) return pushBudgets(id);
+    return gfetch(SHEETS + '/' + id + '/values/Budgets!A1:C').then(function (r) {
+      var v = r.values || [];
+      if (!v.length || String(v[0][0]).toUpperCase() !== 'CATEGORY') {
+        return (myCats.length || Object.keys(bud).length) ? pushBudgets(id) : null;
+      }
+      var b = {}, mine = [];
+      v.slice(1).forEach(function (row) {
+        var c = String(row[0] || '').trim(); if (!c) return;
+        var n = Number(String(row[1] || '').replace(/[^0-9.]/g, ''));
+        if (n > 0) b[c] = n;
+        if (String(row[2] || '').toLowerCase() === 'yes' && BASE_EXP.indexOf(c) < 0) mine.push(c);
+      });
+      bud = b; myCats = mine;
+      save(K.bud, bud); save(K.cats, myCats);
+      CATS.Expense = BASE_EXP.concat(myCats);
+      // The Add form was drawn before these arrived (a new phone, say).
+      if (draft.type === 'Expense' && CATS.Expense.indexOf(draft.category) < 0) draft.category = CATS.Expense[0];
+      buildChips();
+    });
+  }).catch(function () {});        // a missing tab must never stop entries syncing
 }
 
 // ============================ OCR, in the user's own Drive ============================
@@ -942,7 +1069,8 @@ function logout() {
 function resetAll() {
   if (!confirm('Reset Paisa on this phone?\n\nThis removes your login, PIN, budgets and ' +
                'recurring savings from this phone, and disconnects Google. Your sheet stays ' +
-               'in your Google Drive, and signing in again brings your entries back.' +
+               'in your Google Drive, and signing in again brings your entries, budgets and ' +
+               'categories back.' +
                unsyncedWarning())) return;
   var t = gToken;
   Object.keys(K).forEach(function (k) { localStorage.removeItem(K[k]); });
@@ -972,7 +1100,7 @@ function openSwitch() {
     '<ol class="steps">' +
     '<li><b>Get the latest from this account</b><span id="swFreshNote">So entries added on another phone come too.</span>' +
     '<button class="btn ghost sm" id="swFresh" type="button">Refresh now</button></li>' +
-    '<li><b>Choose the new account</b><span>Budgets, monthly savings and your PIN stay on this phone.</span>' +
+    '<li><b>Choose the new account</b><span>Budgets and your categories come too. Monthly savings and your PIN stay on this phone.</span>' +
     '<button class="btn sm" id="swGo" type="button">Choose Google account</button></li></ol>' +
     '<div class="busyline hide" id="swBusy"><span class="spin"></span><span id="swMsg">Working\u2026</span></div>' +
     '<div class="err" id="swErr"></div>' +
@@ -1020,6 +1148,7 @@ function openSwitch() {
         if (acct.mode === 'google') { acct.email = me.email; if (me.name) acct.name = me.name; }
         acct.sheetId = ''; acct.gid = null;
         save(K.acct, acct);
+        save(K.budDirty, 1);              // budgets and categories go across too
         txns.forEach(function (t) { t._s = 0; delete t._row; });
         save(K.txns, txns);
         return ensureSheet()
@@ -1061,7 +1190,7 @@ function changePin() {
 // ============================ sync ============================
 var syncing = false;
 
-function pending(){ return txns.filter(function(t){ return !t._s; }).length; }
+function pending(){ return txns.filter(function(t){ return !t._s || t._mv; }).length; }
 
 function setPill() {
   var p = $('#syncPill'), n = pending();
@@ -1089,8 +1218,10 @@ function sync(interactive) {
     .then(function () {
       return pushRows(txns.filter(function (t) { return !t._s; }));
     })
+    .then(function () { return pushMoves(); })
     .then(function () { return pushShots(); })
     .then(function () { return pullAll(); })
+    .then(function () { return syncBudgets(); })
     .then(function () { return fillIdentity(); })
     .catch(function (e) {
       if (!interactive) return;               // background: the pill says enough
@@ -1121,7 +1252,10 @@ function pullAll() {
     remote.forEach(function (r) { map[r.id] = r; });
     // Keep anything the sheet doesn't have — never drop an entry we may not
     // have successfully pushed yet.
-    txns.forEach(function (t) { if (!map[t.id]) { t._s = 0; map[t.id] = t; } });
+    txns.forEach(function (t) {
+      if (!map[t.id]) { t._s = 0; map[t.id] = t; }
+      else if (t._mv) { t._row = map[t.id]._row; map[t.id] = t; }   // its new date wins
+    });
     txns = Object.keys(map).map(function (k) { return map[k]; });
     txns.sort(function (a,b) { return String(b.ts).localeCompare(String(a.ts)); });
     save(K.txns, txns);
@@ -1260,6 +1394,15 @@ function saveEntry() {
   toast(what + ' ' + money(amt) + ' saved' +
         (month !== ym(new Date()) ? ' in ' + monthName(row.ts).split(' ')[0] : ''));
   renderAll();
+  // A scanned receipt can carry last month's date. The entry is right to
+  // count there, but the Recent list shows the month on screen, so without
+  // this it looks as if Save did nothing.
+  if (month !== viewMonth)
+    scanResult('<div><b>Saved in ' + esc(monthName(row.ts)) + '</b><br>' + esc(what) + ' ' + esc(money(amt)) +
+      ' is dated ' + esc(new Date(row.ts).toLocaleDateString('en-IN', { day:'numeric', month:'short' })) +
+      ', so it counts in that month. ' +
+      '<button class="link inline" type="button" id="seeMonth" data-m="' + esc(month) + '">Show ' +
+      esc(monthName(row.ts).split(' ')[0]) + '</button></div>');
   sync(true);                                 // a click: may reconnect if it must
 }
 
@@ -1346,6 +1489,7 @@ function scanBusy(on, msg) {
 
 function scanResult(html) {
   var el = $('#scanResult');
+  if (!/scanWhere/.test(html)) scanAlt = null;
   if (!html) { el.classList.add('hide'); el.innerHTML = ''; return; }
   el.innerHTML = html; el.classList.remove('hide');
 }
@@ -1393,7 +1537,8 @@ function readScan(big) {
                  'The receipt is attached — just type the amount.</div>');
       return;
     }
-    applyScan(parseReceipt(text));
+    var parsed = parseReceipt(text); parsed.text = text;
+    applyScan(parsed);
   }).catch(function (e) {
     scanBusy(false);
     scanResult('<div><b>Scan failed</b><br>' + esc(authReason(e).slice(0,140)) +
@@ -1401,21 +1546,47 @@ function readScan(big) {
   });
 }
 
+/* parseReceipt and MERCHANTS are ported unchanged from Code.gs and tested
+   as they are, so their older category names are translated here instead. */
+var FUEL_RE = /petrol|diesel|fuel|indian ?oil|petroleum|bpcl|hpcl|iocl|nayara|\bshell\b/i;
+var WIFI_RE = /broadband|fiber|fibre|fibernet|wifi|wi-fi|hathway|xstream/i;
+
+function appCat(c, text) {
+  if (draft.type !== 'Expense' || !c) return c;
+  text = String(text || '');
+  if (c === 'Transportation' && FUEL_RE.test(text)) return 'Fuel';
+  if (c === 'Bills & Recharge') return WIFI_RE.test(text) ? 'Wifi' : 'Others';
+  if (c === 'Rent / EMI') return /\bemi\b|loan|finserv/i.test(text) ? 'EMI' : 'Rent';
+  if (c === 'Entertainment') return 'Entertainment/OTT';
+  if (c === 'Other') return 'Others';
+  if (CATS.Expense.indexOf(c) > -1) return c;   // Health, say, once the user has added it
+  return 'Others';
+}
+
 function applyScan(r) {
   var got = [], cats = CATS[draft.type];
+  r.category = appCat(r.category, (r.merchant || '') + ' ' + (r.text || ''));
   if (r.amount) { $('#amt').value = r.amount; got.push('amount ' + money(r.amount)); }
   if (r.category && cats.indexOf(r.category) > -1) { draft.category = r.category; got.push('category ' + r.category); }
   if (r.mode && MODES[draft.type].indexOf(r.mode) > -1) draft.mode = r.mode;
   buildChips();
   if (r.merchant) $('#rem').value = r.merchant;
 
+  /* v14: an entry goes in the month on screen, whatever the receipt says.
+     A receipt from that same month just lends its exact date and time. One
+     from another month is offered as a choice: "Move to October". */
   var when = r.when, note = '';
   if (when && !isNaN(when.getTime())) {
-    $('#dt').value = ymd(when);
-    $('#tm').value = pad(when.getHours()) + ':' + pad(when.getMinutes());
-    got.push('date ' + when.toLocaleDateString('en-IN', { day:'numeric', month:'short' }));
-    if (ym(when) !== ym(new Date()))
-      note = ' It will count in <b>' + esc(monthName(when)) + '</b>, the month it was paid.';
+    var paid = when.toLocaleDateString('en-IN', { day:'numeric', month:'short' });
+    if (ym(when) === viewMonth) {
+      $('#dt').value = ymd(when);
+      $('#tm').value = pad(when.getHours()) + ':' + pad(when.getMinutes());
+      got.push('date ' + paid);
+    } else {
+      scanAlt = { d: ymd(when), t: pad(when.getHours()) + ':' + pad(when.getMinutes()),
+                  form: { d: $('#dt').value, t: $('#tm').value } };
+      note = '<span id="scanWhere">' + whereNote(false) + '</span>';
+    }
   }
 
   if (!got.length) {
@@ -1426,6 +1597,29 @@ function applyScan(r) {
   scanResult('<div><b>Read ' + esc(got.join(', ')) + '</b><br>' +
              'Check it below and fix anything wrong, then tap Save.' + note + '</div>');
   if (!r.amount) $('#amt').focus();
+}
+
+/* The receipt's own date, when it is in another month, held so the user can
+   move the entry there and back before saving. */
+var scanAlt = null;
+
+function whereNote(moved) {
+  var on = monthName(ymDate(viewMonth)).split(' ')[0];
+  var paidM = monthName(ymDate(scanAlt.d.slice(0, 7))).split(' ')[0];
+  var paid = new Date(scanAlt.d + 'T12:00').toLocaleDateString('en-IN', { day:'numeric', month:'short' });
+  return moved
+    ? ' Moved to <b>' + esc(paidM) + '</b>, dated ' + esc(paid) + ' as on the receipt. ' +
+      '<button class="link inline" type="button" id="scanKeep">Keep in ' + esc(on) + '</button>'
+    : ' Paid on ' + esc(paid) + '; it goes in <b>' + esc(on) + '</b>, the month on screen. ' +
+      '<button class="link inline" type="button" id="scanMove">Move to ' + esc(paidM) + '</button>';
+}
+
+function moveScan(moved) {
+  if (!scanAlt) return;
+  $('#dt').value = moved ? scanAlt.d : scanAlt.form.d;
+  $('#tm').value = moved ? scanAlt.t : scanAlt.form.t;
+  freqHint();
+  var el = $('#scanWhere'); if (el) el.innerHTML = whereNote(moved);
 }
 
 function takeSharedImage() {
@@ -1516,7 +1710,7 @@ function renderStats() {
       (sav > 0 ? ' · saved ' + Math.round(sav / inc * 100) + '% of income' : '')
     : 'Add your income to see what is left over.';
 
-  var limit = Number(bud.TOTAL) || 0, meter = $('#sMeter'), alerts = [];
+  var limit = budTotal(), meter = $('#sMeter'), alerts = [];
   var byCat = byCategory(list, 'Expense');
   if (limit > 0) {
     var pct = exp / limit;
@@ -1533,7 +1727,7 @@ function renderStats() {
     $('#sLeft').textContent = '—';
   }
   Object.keys(bud).forEach(function (c) {
-    if (c === 'TOTAL' || !bud[c]) return;
+    if (!bud[c]) return;
     var spent = byCat[c] || 0;
     if (spent >= bud[c]) alerts.push(['crit', c + ' over limit',
       money(spent) + ' spent against a ' + money(bud[c]) + ' limit.']);
@@ -1706,6 +1900,10 @@ function openTx(id) {
     (isNaN(d.getTime()) ? '' : esc(d.toLocaleString('en-IN'))) +
     (String(t.id).indexOf('rec-') === 0 ? '<br>Added by a monthly saving' : '') + '</p>' +
     (img ? '<img src="' + esc(img) + '" style="width:100%;border-radius:12px;margin-bottom:14px" alt="receipt">' : '') +
+    '<div style="margin-bottom:14px">' +
+    '<label class="f"><span>Move to another date</span>' +
+    '<input class="in" id="txDate" type="date" value="' + esc(isNaN(d.getTime()) ? '' : ymd(d)) + '"></label>' +
+    '<button class="btn ghost sm" id="txMove" type="button" data-id="' + esc(t.id) + '" style="margin-top:8px">Move</button></div>' +
     '<button class="btn danger sm" id="txDel">Delete entry</button>' +
     '<button class="btn ghost sm" id="txNo" style="margin-top:8px">Close</button></div>';
   document.body.appendChild(w);
@@ -1722,21 +1920,131 @@ function openTx(id) {
   };
 }
 
+/** Gives a saved entry a new date, and so a new month. The time is kept. */
+function moveTx(id) {
+  var t = byId(id), v = $('#txDate') && $('#txDate').value;
+  if (!t || !/^\d{4}-\d{2}-\d{2}$/.test(v || '')) { toast('Pick a date'); return; }
+  if (v === String(t.ts).slice(0, 10)) { toast('That is already its date'); return; }
+  t.ts = v + 'T' + (String(t.ts).slice(11, 19) || '12:00:00');
+  if (t._s) t._mv = 1;                        // its row in the sheet needs rewriting
+  txns.sort(function (a,b) { return String(b.ts).localeCompare(String(a.ts)); });
+  save(K.txns, txns);
+  var sheet = document.querySelector('.sheet'); if (sheet) sheet.remove();
+  var m = ym(t.ts);
+  toast('Moved to ' + new Date(v + 'T12:00').toLocaleDateString('en-IN', { day:'numeric', month:'short' }));
+  if (m !== viewMonth)
+    scanResult('<div><b>Moved to ' + esc(monthName(t.ts)) + '</b><br>' + esc(t.remarks || t.category) + ' ' +
+      esc(money(t.amount)) + ' now counts in that month. ' +
+      '<button class="link inline" type="button" id="seeMonth" data-m="' + esc(m) + '">Show ' +
+      esc(monthName(t.ts).split(' ')[0]) + '</button></div>');
+  renderAll();
+  sync(true);                                 // a click: may reconnect if it must
+}
+
 // ============================ budget ============================
+// ============================ budget (v15) ============================
+/* One amount and one category set a budget. The list shows only categories
+   with a budget, plus any category money went to this month without one
+   (so nothing spent is invisible here). The total is the sum of the
+   category budgets, never a separate number that could disagree. */
+var budPick = 'Food', budEdit = '';
+
+function budTotal() {
+  return Object.keys(bud).reduce(function (a, c) { return a + (Number(bud[c]) || 0); }, 0);
+}
+
+function budStatus(s, lim) {
+  if (s > lim) return { cls: 'crit', txt: 'Exceeded by ' + money(s - lim) };
+  if (s >= lim * 0.8) return { cls: 'warn', txt: money(lim - s) + ' left \u00b7 ' + Math.round(s / lim * 100) + '% used' };
+  return { cls: 'ok', txt: money(lim - s) + ' left' };
+}
+
 function renderBudget() {
   var spent = byCategory(inMonth(viewMonth), 'Expense'), total = 0;
   Object.keys(spent).forEach(function (c) { total += spent[c]; });
   var mName = monthName(ymDate(viewMonth)).split(' ')[0];
-  $('#bTotal').value = bud.TOTAL || '';
-  $('#bTotalSpent').textContent = money(total) + ' spent in ' + mName;
-  $('#bCats').innerHTML = CATS.Expense.map(function (c) {
-    var s = spent[c] || 0, lim = bud[c] || 0;
-    var cls = lim && s >= lim ? 'crit' : (lim && s >= lim * 0.8 ? 'warn' : '');
-    return '<label class="f"><span>' + esc(c) +
-      '<em class="' + cls + '">' + money(s) + (lim ? ' of ' + money(lim) : ' spent') + '</em></span>' +
-      '<input class="in bcat" data-c="' + esc(c) + '" type="number" inputmode="numeric" ' +
-      'placeholder="no limit" value="' + (lim || '') + '"></label>';
-  }).join('');
+  var lim = budTotal();
+
+  $('#bTotalV').textContent = money(lim);
+  var st = lim ? budStatus(total, lim) : null;
+  $('#bTotalSub').innerHTML = esc(money(total)) + ' spent in ' + esc(mName) +
+    (st ? ' \u00b7 <b class="' + st.cls + '">' + esc(st.txt) + '</b>' : '');
+  $('#bTotalMeter').style.width = lim ? Math.min(100, total / lim * 100) + '%' : '0';
+  $('#bTotalMeter').className = st && st.cls !== 'ok' ? st.cls : '';
+
+  if (CATS.Expense.indexOf(budPick) < 0) budPick = CATS.Expense[0];
+  $('#bCatChips').innerHTML = CATS.Expense.map(function (c) {
+    var chip = '<button class="chip" type="button" data-v="' + esc(c) + '" aria-pressed="' + (c === budPick) + '">' +
+               esc(c) + '</button>';
+    return myCats.indexOf(c) < 0 ? chip
+      : '<span class="chipx">' + chip + '<button class="x" type="button" data-rm="' + esc(c) +
+        '" aria-label="Remove ' + esc(c) + '">\u00d7</button></span>';
+  }).join('') + '<button class="chip add" type="button" id="bNewChip">+ New category</button>';
+  $('#bSet').textContent = bud[budPick] ? 'Update ' + budPick + ' budget' : 'Set budget';
+
+  var names = Object.keys(bud).filter(function (c) { return bud[c] > 0; });
+  Object.keys(spent).forEach(function (c) { if (names.indexOf(c) < 0) names.push(c); });
+  names.sort(function (a, b) { return (bud[b] ? 1 : 0) - (bud[a] ? 1 : 0) || (spent[b] || 0) - (spent[a] || 0); });
+
+  $('#bList').innerHTML = names.length ? names.map(function (c) {
+    var s = spent[c] || 0, l = Number(bud[c]) || 0, x = l ? budStatus(s, l) : null;
+    var editing = budEdit === c;
+    return '<div class="brow' + (x ? ' ' + x.cls : ' none') + '">' +
+      '<div class="bhead"><b>' + esc(c) + '</b>' +
+      '<span class="bst">' + (x ? esc(x.txt) : 'No budget set') + '</span></div>' +
+      (l ? '<div class="meter"><i class="' + (x.cls === 'ok' ? '' : x.cls) + '" style="width:' +
+           Math.min(100, s / l * 100) + '%"></i></div>' : '') +
+      '<div class="bfoot"><span>' + esc(money(s)) + ' spent' + (l ? ' of ' + esc(money(l)) : ' in ' + esc(mName)) + '</span>' +
+      (editing ? '' : '<button class="link inline bEdit" type="button" data-c="' + esc(c) + '">' +
+                      (l ? 'Edit' : 'Set budget') + '</button>') + '</div>' +
+      (editing ? '<div class="bedit"><input class="in" id="bEditAmt" type="number" inputmode="numeric" ' +
+                 'placeholder="Monthly budget (\u20b9)" value="' + (l || '') + '">' +
+                 '<button class="btn sm" type="button" id="bEditSave" data-c="' + esc(c) + '">Save</button>' +
+                 (l ? '<button class="btn ghost sm" type="button" id="bEditDel" data-c="' + esc(c) + '">Remove</button>' : '') +
+                 '<button class="btn ghost sm" type="button" id="bEditNo">Cancel</button></div>' : '') +
+      '</div>';
+  }).join('') : '<div class="empty" style="padding:14px 0">No budgets yet. Enter an amount, pick a ' +
+                'category and tap Set budget.</div>';
+}
+
+function setBudget(c, n) {
+  if (n > 0) bud[c] = n; else delete bud[c];
+  budChanged();
+  budEdit = '';
+  renderBudget(); renderStats();
+  sync(true);                                 // a click: may reconnect if it must
+}
+
+function addBudget() {
+  var n = Number(String($('#bAmt').value).replace(/[^0-9.]/g, ''));
+  if (!(n > 0)) { toast('Enter an amount'); $('#bAmt').focus(); return; }
+  var was = bud[budPick];
+  $('#bAmt').value = '';
+  setBudget(budPick, n);
+  toast(budPick + ' budget ' + (was ? 'updated to ' : 'set to ') + money(n));
+}
+
+function addCategory() {
+  var v = String($('#bNewName').value || '').replace(/\s+/g, ' ').trim().slice(0, 30);
+  if (!v) { toast('Type a name for the category'); $('#bNewName').focus(); return; }
+  if (v.indexOf(SUB_SEP.trim()) > -1) { toast('Leave out the \u00b7 sign'); return; }
+  var hit = CATS.Expense.filter(function (c) { return c.toLowerCase() === v.toLowerCase(); })[0];
+  if (hit) { budPick = hit; toast(hit + ' is already in the list'); }
+  else { myCats.push(v); budPick = v; budChanged(); toast(v + ' added. It shows on Add too.'); sync(true); }
+  $('#bNewName').value = '';
+  $('#bNewRow').classList.add('hide');
+  renderBudget(); buildChips();
+}
+
+function removeCategory(c) {
+  if (!confirm('Remove "' + c + '" from your categories?\n\nEntries already in it stay as they are.' +
+               (bud[c] ? ' Its ' + money(bud[c]) + ' budget is removed.' : ''))) return;
+  myCats = myCats.filter(function (x) { return x !== c; });
+  delete bud[c];
+  budChanged();
+  if (draft.category === c) draft.category = CATS.Expense[0];
+  renderBudget(); renderStats(); buildChips();
+  sync(true);
 }
 
 function renderRecur() {
@@ -1792,19 +2100,6 @@ function saveName() {
   if (v === (acct.name || '')) return;
   acct.name = v; save(K.acct, acct);
   toast(v ? 'Name saved' : 'Name removed');
-}
-
-function saveBudgets() {
-  bud = {};
-  var t = Number($('#bTotal').value);
-  if (t > 0) bud.TOTAL = t;
-  $$('.bcat').forEach(function (el) {
-    var n = Number(el.value); if (n > 0) bud[el.dataset.c] = n;
-  });
-  save(K.bud, bud);
-  toast('Budgets saved');
-  renderStats();
-  renderBudget();
 }
 
 function exportCsv() {
@@ -1919,6 +2214,7 @@ function init() {
     if (/^\d{4}-\d{2}$/.test(k) && k !== viewMonth) { viewMonth = k; selDay = ''; renderAll(); }
   });
 
+  document.addEventListener('click', renewOnTap, true);   // capture: runs first, same click
   $('#save').addEventListener('click', saveEntry);
   $('#scanBtn').addEventListener('click', function () { $('#scanIn').click(); });
   $('#scanIn').addEventListener('change', function (e) { scanReceipt(e.target.files[0]); e.target.value = ''; });
@@ -1944,6 +2240,11 @@ function init() {
     var m = e.target.closest('.monthnav button, #backNote button');
     if (m) { stepMonth(+m.dataset.step); return; }
     if (e.target.closest('#acReconnect')) { sync(true).then(renderSettings); return; }
+    if (e.target.closest('#scanMove')) { moveScan(true); return; }
+    if (e.target.closest('#scanKeep')) { moveScan(false); return; }
+    if (e.target.closest('#txMove')) { moveTx(e.target.closest('#txMove').dataset.id); return; }
+    var sm = e.target.closest('#seeMonth');
+    if (sm) { viewMonth = sm.dataset.m; selDay = ''; scanResult(''); go('hist'); renderAll(); return; }
     var c = e.target.closest('#trend .col');
     if (c) { viewMonth = c.dataset.m; selDay = ''; renderAll(); return; }
     var d = e.target.closest('#cal .day');
@@ -1961,7 +2262,35 @@ function init() {
     buildFilters(); renderHist();
   });
 
-  $('#bSave').addEventListener('click', saveBudgets);
+  $('#bSet').addEventListener('click', addBudget);
+  $('#bAmt').addEventListener('keydown', function (e) { if (e.key === 'Enter') addBudget(); });
+  $('#bNewAdd').addEventListener('click', addCategory);
+  $('#bNewName').addEventListener('keydown', function (e) { if (e.key === 'Enter') addCategory(); });
+  $('#bCatChips').addEventListener('click', function (e) {
+    var rm = e.target.closest('[data-rm]');
+    if (rm) { removeCategory(rm.dataset.rm); return; }
+    if (e.target.closest('#bNewChip')) {
+      $('#bNewRow').classList.toggle('hide');
+      if (!$('#bNewRow').classList.contains('hide')) $('#bNewName').focus();
+      return;
+    }
+    var b = e.target.closest('.chip[data-v]'); if (!b) return;
+    budPick = b.dataset.v; renderBudget();
+    if (bud[budPick] && !$('#bAmt').value) $('#bAmt').value = bud[budPick];
+  });
+  $('#bList').addEventListener('click', function (e) {
+    var ed = e.target.closest('.bEdit');
+    if (ed) { budEdit = ed.dataset.c; renderBudget(); var a = $('#bEditAmt'); if (a) a.focus(); return; }
+    if (e.target.closest('#bEditNo')) { budEdit = ''; renderBudget(); return; }
+    var del = e.target.closest('#bEditDel');
+    if (del) { setBudget(del.dataset.c, 0); toast(del.dataset.c + ' budget removed'); return; }
+    var sv = e.target.closest('#bEditSave');
+    if (sv) {
+      var n = Number(String($('#bEditAmt').value).replace(/[^0-9.]/g, ''));
+      if (!(n > 0)) { toast('Enter an amount, or tap Remove'); return; }
+      setBudget(sv.dataset.c, n); toast(sv.dataset.c + ' budget ' + money(n));
+    }
+  });
   $('#recAdd').addEventListener('click', function () {
     go('add'); setType('Savings'); draft.freq = 'monthly'; buildChips(); $('#amt').focus();
   });
